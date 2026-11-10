@@ -1,6 +1,5 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
 
-# dependencies
+# Dependencies
 node_modules/
 
 # Expo
@@ -22,7 +21,7 @@ android/
 # Metro
 .metro-health-check*
 
-# debug
+# Debug
 npm-debug.*
 yarn-debug.*
 yarn-error.*
@@ -31,11 +30,26 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# local env files
-.env*.local
-
-# typescript
-*.tsbuildinfo
-.vercel
-
+# Environment variables and secrets
 .env
+.env.*
+!.env.example
+!.env.template
+
+# Firebase private credentials
+service-account*.json
+firebase-adminsdk*.json
+
+# Cloudflare secrets
+.dev.vars
+.dev.vars.*
+
+# TypeScript
+*.tsbuildinfo
+
+# Deployment
+.vercel/
+.wrangler/
+
+# Editor
+.vscode/
