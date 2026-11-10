@@ -1,0 +1,1 @@
+- [AI provider routing](ai-provider-routing.md) — keep server-side provider selection aligned with the credential format and available token budget.

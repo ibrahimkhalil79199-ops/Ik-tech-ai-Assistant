@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/"
+title = "IK TECH AI"
+description = "A multilingual mobile AI assistant with natural text chat, local conversation history, and a secure backend boundary designed for future image and voice features."
+version = "1.0.0"
+id = "artifacts/ik-tech-ai"
+router = "path"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/"
+paths = [ "/" ]
+localPort = 22646
+
+[services.development]
+run = "pnpm --filter @workspace/ik-tech-ai run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/ik-tech-ai", "run", "build:web" ]
+run = [ "pnpm", "--filter", "@workspace/ik-tech-ai", "run", "serve:web" ]
+
+[services.env]
+PORT = "22646"
+BASE_PATH = "/"

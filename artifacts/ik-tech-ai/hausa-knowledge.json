@@ -1,0 +1,131 @@
+
+{
+  "name": "IK TECH Hausa Knowledge Base",
+  "version": "1.0.0",
+  "language": "ha",
+  "description": "Kundin ilimin Hausa domin taimaka wa IK TECH AI fahimtar Hausa da amsa tambayoyi cikin inganci.",
+  "entries": [
+    {
+      "id": "ha001",
+      "category": "greeting",
+      "questions": [
+        "Sannu",
+        "Ina kwana",
+        "Ina wuni",
+        "Yaya kake"
+      ],
+      "answer": "Wa alaikumus salam! Barka da zuwa. Me zan taimaka maka da shi yau?",
+      "keywords": ["sannu", "barka", "ina kwana", "ina wuni"]
+    },
+    {
+      "id": "ha002",
+      "category": "language",
+      "questions": [
+        "Menene Hausa?",
+        "Ka bayyana harshen Hausa"
+      ],
+      "answer": "Hausa harshe ne da ake magana da shi a Najeriya, Nijar da wasu ƙasashen Afirka. Yana da tsarin nahawu, karin magana da adabin gargajiya.",
+      "keywords": ["Hausa", "harshe", "nahawu"]
+    },
+    {
+      "id": "ha003",
+      "category": "orthography",
+      "questions": [
+        "Waɗanne haruffa ne na musamman a Hausa?",
+        "Menene ɓ ɗ ƙ ƴ?"
+      ],
+      "answer": "Haruffan Hausa na musamman sun haɗa da ɓ, ɗ, ƙ da ƴ. Ya kamata a rubuta su yadda ya dace, kada a maye gurbinsu da b, d, k ko y idan ana nufin waɗannan haruffa.",
+      "keywords": ["haruffa", "ɓ", "ɗ", "ƙ", "ƴ", "rubutu"]
+    },
+    {
+      "id": "ha004",
+      "category": "grammar",
+      "questions": [
+        "Menene nahawun Hausa?",
+        "Ka bayyana nahawu"
+      ],
+      "answer": "Nahawu shi ne tsarin ƙa'idojin da ke bayyana yadda ake haɗa kalmomi domin gina jimloli masu ma'ana.",
+      "keywords": ["nahawu", "jimla", "kalmomi"]
+    },
+    {
+      "id": "ha005",
+      "category": "translation",
+      "questions": [
+        "Menene fassara?",
+        "Me ake nufi da translation?"
+      ],
+      "answer": "Fassara ita ce mayar da ma'anar magana ko rubutu daga wani harshe zuwa wani harshe, tare da kiyaye ainihin ma'anar saƙon.",
+      "keywords": ["fassara", "translation", "harshe"]
+    },
+    {
+      "id": "ha006",
+      "category": "technology",
+      "questions": [
+        "Menene Artificial Intelligence?",
+        "Menene AI?"
+      ],
+      "answer": "Artificial Intelligence (AI) fasaha ce da ke ba kwamfuta damar gudanar da ayyuka kamar fahimtar harshe, nazarin bayanai, gane hotuna da taimakawa wajen warware matsaloli.",
+      "keywords": ["AI", "Artificial Intelligence", "fasaha", "kwamfuta"]
+    },
+    {
+      "id": "ha007",
+      "category": "technology",
+      "questions": [
+        "Menene programming?",
+        "Menene coding?"
+      ],
+      "answer": "Programming ko coding shi ne rubuta umarni da kwamfuta za ta bi domin gudanar da wani aiki ko gina manhaja.",
+      "keywords": ["programming", "coding", "software"]
+    },
+    {
+      "id": "ha008",
+      "category": "education",
+      "questions": [
+        "Menene Computer Science?",
+        "Me ake karantawa a Computer Science?"
+      ],
+      "answer": "Computer Science fanni ne da ke nazarin kwamfuta, algorithms, programming, bayanai, tsarin kwamfuta da hanyoyin warware matsaloli ta amfani da fasaha.",
+      "keywords": ["Computer Science", "ilimi", "kwamfuta"]
+    },
+    {
+      "id": "ha009",
+      "category": "science",
+      "questions": [
+        "Menene kimiyya?",
+        "Ka bayyana science"
+      ],
+      "answer": "Kimiyya hanya ce ta bincike da lura da gwaji domin fahimtar abubuwan da ke faruwa a duniya da yadda suke aiki.",
+      "keywords": ["kimiyya", "science", "bincike"]
+    },
+    {
+      "id": "ha010",
+      "category": "communication",
+      "questions": [
+        "Yaya ake gaishe da mutum cikin ladabi?",
+        "Ka ba ni misalin gaisuwa"
+      ],
+      "answer": "Ana iya cewa: Assalamu alaikum, barka da safiya, barka da rana, ko barka da yamma. Amsa gaisuwa cikin ladabi yana nuna mutunta juna.",
+      "keywords": ["gaisuwa", "ladabi", "mutunci"]
+    },
+    {
+      "id": "ha011",
+      "category": "writing",
+      "questions": [
+        "Yaya ake rubuta Hausa mai kyau?",
+        "Ka koya min rubutun Hausa"
+      ],
+      "answer": "Domin rubuta Hausa mai kyau, a kula da tsarin jimla, amfani da kalmomin da suka dace, alamomin rubutu da haruffan musamman kamar ɓ, ɗ, ƙ da ƴ.",
+      "keywords": ["rubutu", "Hausa mai kyau", "alamomin rubutu"]
+    },
+    {
+      "id": "ha012",
+      "category": "proverbs",
+      "questions": [
+        "Menene karin magana?",
+        "Ka bayyana karin magana"
+      ],
+      "answer": "Karin magana wata gajeriyar magana ce mai ɗauke da hikima ko darasi. Ana amfani da ita wajen bayyana wani tunani cikin salo na musamman.",
+      "keywords": ["karin magana", "hikima", "adabi"]
+    }
+  ]
+}
