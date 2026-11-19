@@ -1376,6 +1376,7 @@ function HomeScreenMain() {
 
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordError, setPasswordError] = useState<string | null>(null);
@@ -4887,34 +4888,47 @@ const handleForgotPassword = useCallback(async () => {
               style={styles.authInput}
             />
 
-               <TextInput
-                 value={authPassword}
-                 onChangeText={setAuthPassword}
-                 placeholder="Password"
-                 placeholderTextColor="#718096"
-                 secureTextEntry
-                 style={styles.authInput}
-               />
-            <Pressable
-              onPress={handleAuth}
-              style={styles.authButton}
-            >
-                          {authMode === 'login' && (
-              <Pressable
-                onPress={handleForgotPassword}
-                style={{ alignSelf: 'flex-end', marginBottom: 14 }}
-              >
-                <Text style={{ color: '#60A5FA', fontSize: 13, fontWeight: '700' }}>
-                  Forgot password?
-                </Text>
-              </Pressable>
-            )}
-              <Text style={styles.authButtonText}>
-                {authMode === 'login'
-                  ? 'Login'
-                  : 'Sign Up'}
-              </Text>
-            </Pressable>
+
+<View style={{ position: 'relative', justifyContent: 'center' }}>
+  <TextInput
+    value={authPassword}
+    onChangeText={setAuthPassword}
+    placeholder="Password"
+    placeholderTextColor="#718096"
+    secureTextEntry={!showPassword}
+    style={[styles.authInput, { paddingRight: 50 }]}
+  />
+  <Pressable
+    onPress={() => setShowPassword(!showPassword)}
+    style={{ position: 'absolute', right: 15, padding: 8 }}
+  >
+    <Ionicons
+      name={showPassword ? 'eye-off-outline' : 'eye-outline'}
+      size={22}
+      color="#718096"
+    />
+  </Pressable>
+</View>
+
+{authMode === 'login' && (
+  <Pressable
+    onPress={handleForgotPassword}
+    style={{ alignSelf: 'flex-end', marginBottom: 14 }}
+  >
+    <Text style={{ color: '#60A5FA', fontSize: 13, fontWeight: '700' }}>
+      Forgot password?
+    </Text>
+  </Pressable>
+)}
+
+<Pressable
+  onPress={handleAuth}
+  style={styles.authButton}
+>
+  <Text style={styles.authButtonText}>
+    {authMode === 'login' ? 'Login' : 'Sign Up'}
+  </Text>
+</Pressable>
 
             <Pressable
               onPress={() => {
