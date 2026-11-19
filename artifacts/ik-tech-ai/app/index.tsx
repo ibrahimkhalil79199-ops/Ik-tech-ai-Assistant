@@ -6809,7 +6809,7 @@ const handleForgotPassword = useCallback(async () => {
 
                         <Text
                           style={{
-                            color: '#ffffff',
+                            color: primaryText,
                             fontSize: 25,
                             fontWeight: '700',
                           }}
