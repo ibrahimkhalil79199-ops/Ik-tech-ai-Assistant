@@ -13,7 +13,7 @@ import {
   KeyboardAvoidingView,
   Modal,
   Platform,
-  Pressable,
+  Pressable as RNPressable,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -24,6 +24,7 @@ import {
   useColorScheme,
   ActivityIndicator,
   AppState,
+  BackHandler,
   Keyboard,
   Linking,
   Share,
@@ -118,11 +119,11 @@ function AppDialogHost() {
   return (
     <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={() => { if (dialog.cancelable) close(dialog.buttons.find((button) => button.style === 'cancel')); }}>
       <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.62)', alignItems: 'center', justifyContent: 'center', padding: 26 }}>
-        <View style={{ width: '100%', maxWidth: 360, borderRadius: 22, backgroundColor: '#13202f', borderWidth: 1, borderColor: '#223650', padding: 20 }}>
-          <Text style={{ color: '#ffffff', fontSize: 18, fontWeight: '800', marginBottom: dialog.message ? 8 : 16 }}>{dialog.title}</Text>
+        <View style={{ width: '100%', maxWidth: 360, borderRadius: 22, backgroundColor: uiLightMode ? '#ffffff' : '#13202f', borderWidth: 1, borderColor: uiLightMode ? '#d5deea' : '#223650', padding: 20 }}>
+          <Text style={{ color: uiLightMode ? '#142033' : '#ffffff', fontSize: 18, fontWeight: '800', marginBottom: dialog.message ? 8 : 16 }}>{dialog.title}</Text>
           {dialog.message ? (
             <ScrollView style={{ maxHeight: 260, marginBottom: 16 }}>
-              <Text style={{ color: '#c4d3e6', fontSize: 15, lineHeight: 22 }}>{dialog.message}</Text>
+              <Text style={{ color: uiLightMode ? '#526176' : '#c4d3e6', fontSize: 15, lineHeight: 22 }}>{dialog.message}</Text>
             </ScrollView>
           ) : null}
           <View style={{ flexDirection: stacked ? 'column' : 'row', gap: 10 }}>
@@ -133,9 +134,9 @@ function AppDialogHost() {
                 <Pressable
                   key={`${button.text}-${index}`}
                   onPress={() => close(button)}
-                  style={{ flex: stacked ? undefined : 1, minHeight: 46, borderRadius: 14, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12, backgroundColor: destructive ? 'rgba(255,90,90,0.18)' : cancel ? '#223650' : '#2563a8' }}
+                  style={{ flex: stacked ? undefined : 1, minHeight: 46, borderRadius: 14, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12, backgroundColor: destructive ? 'rgba(255,90,90,0.18)' : cancel ? (uiLightMode ? '#e5edf6' : '#223650') : '#2563a8' }}
                 >
-                  <Text style={{ color: destructive ? '#ff7b7b' : '#ffffff', fontSize: 15, fontWeight: '800' }}>{button.text || 'OK'}</Text>
+                  <Text style={{ color: destructive ? (uiLightMode ? '#d92d20' : '#ff7b7b') : (cancel && uiLightMode) ? '#142033' : '#ffffff', fontSize: 15, fontWeight: '800' }}>{button.text || 'OK'}</Text>
                 </Pressable>
               );
             })}
@@ -422,6 +423,357 @@ let ViewShotModule: any = null;
 try { ViewShotModule = require('react-native-view-shot'); } catch (_error) { ViewShotModule = null; }
 let NotificationsModule: any = null;
 try { NotificationsModule = require('expo-notifications'); } catch (_error) { NotificationsModule = null; }
+
+// ───────────────── Theme helpers (light / dark), press feedback, toast ─────────────────
+let uiLightMode = false;
+let activeStyles: any = null;
+const S = (): any => activeStyles || baseStyles;
+
+const hexToRgb = (value: string): [number, number, number] | null => {
+  let h = value.replace('#', '');
+  if (h.length === 3) h = h.split('').map((x) => x + x).join('');
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return null;
+  const n = parseInt(h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+
+const rgbToHsl = (r0: number, g0: number, b0: number): [number, number, number] => {
+  const r = r0 / 255; const g = g0 / 255; const b = b0 / 255;
+  const max = Math.max(r, g, b); const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  let h = 0; let s = 0;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return [h, s, l];
+};
+
+const hslToHex = (h: number, s: number, l: number): string => {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0; let g = 0; let b = 0;
+  if (h < 60) { r = c; g = x; } else if (h < 120) { r = x; g = c; } else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; } else if (h < 300) { r = x; b = c; } else { r = c; b = x; }
+  const to = (v: number) => Math.round((v + m) * 255).toString(16).padStart(2, '0');
+  return `#${to(r)}${to(g)}${to(b)}`;
+};
+
+// Turns any colour that was designed for the dark theme into a matching light-theme colour.
+const toLightColor = (key: string, value: string, accent: string): string => {
+  const rgb = hexToRgb(value);
+  if (!rgb) return value;
+  const [h, s, l] = rgbToHsl(rgb[0], rgb[1], rgb[2]);
+  if (key === 'backgroundColor') {
+    if (l < 0.36) return hslToHex(h, Math.min(s, 0.45), Math.min(0.97, 0.985 - l * 0.5));
+    return value;
+  }
+  if (key === 'borderColor') {
+    if (l < 0.42) return hslToHex(h, Math.min(s, 0.35), 0.86);
+    if (l > 0.62 && s > 0.4) return accent;
+    return value;
+  }
+  // text and icon colours
+  if (l > 0.55) {
+    const reddish = (h < 25 || h > 335) && s > 0.3;
+    const greenish = h >= 90 && h <= 170 && s > 0.3;
+    if (reddish) return '#c62828';
+    if (greenish) return '#1b7f4b';
+    if (s > 0.55 && l < 0.82 && h >= 190 && h <= 240) return accent;
+    if (l > 0.82) return '#142033';
+    return '#526176';
+  }
+  return value;
+};
+
+// Every button, row and icon in the app gives a small “pressed” feedback (dim + tiny vibration).
+const Pressable = React.forwardRef<any, React.ComponentProps<typeof RNPressable>>((props, ref) => {
+  const { style, onPress, ...rest } = props as any;
+  return (
+    <RNPressable
+      ref={ref}
+      {...rest}
+      onPress={onPress ? (event: any) => {
+        try { Haptics.selectionAsync().catch(() => {}); } catch (_error) { /* ignore */ }
+        return onPress(event);
+      } : undefined}
+      style={(state: any) => [typeof style === 'function' ? style(state) : style, state.pressed ? { opacity: 0.7 } : null]}
+    />
+  );
+});
+
+// Small message that pops up for a moment (e.g. “Thank you for feedback”).
+type ToastState = { id: number; message: string; icon?: string };
+let toastListener: ((toast: ToastState | null) => void) | null = null;
+let toastCounter = 0;
+const showToast = (message: string, icon?: string) => {
+  toastCounter += 1;
+  if (toastListener) toastListener({ id: toastCounter, message, icon });
+};
+
+function ToastHost() {
+  const [toast, setToast] = useState<ToastState | null>(null);
+  useEffect(() => {
+    toastListener = setToast;
+    return () => { if (toastListener === setToast) toastListener = null; };
+  }, []);
+  useEffect(() => {
+    if (!toast) return undefined;
+    const timer = setTimeout(() => setToast((current) => (current && current.id === toast.id ? null : current)), 2400);
+    return () => clearTimeout(timer);
+  }, [toast]);
+  if (!toast) return null;
+  return (
+    <View pointerEvents="none" style={{ position: 'absolute', left: 16, right: 16, bottom: Platform.OS === 'web' ? 90 : 110, zIndex: 10000, elevation: 40, alignItems: 'center' }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', maxWidth: 420, paddingVertical: 12, paddingHorizontal: 16, borderRadius: 16, backgroundColor: uiLightMode ? '#1b2a3d' : '#22354d', borderWidth: 1, borderColor: uiLightMode ? '#2b4668' : '#35557a' }}>
+        <Ionicons name={(toast.icon || 'checkmark-circle') as any} size={20} color="#4ade80" style={{ marginRight: 10 }} />
+        <Text style={{ color: '#ffffff', fontSize: 14, fontWeight: '700', flexShrink: 1 }}>{toast.message}</Text>
+      </View>
+    </View>
+  );
+}
+
+// ───────────────── Opening video / audio / PDF inside the app ─────────────────
+let ExpoVideoModule: any = null;
+try { ExpoVideoModule = require('expo-video'); } catch (_error) { ExpoVideoModule = null; }
+
+function NativeMediaPlayer({ uri }: { uri: string }) {
+  const player = ExpoVideoModule.useVideoPlayer(uri, (instance: any) => { instance.loop = false; instance.play(); });
+  const VideoView = ExpoVideoModule.VideoView;
+  return <VideoView player={player} style={{ width: '100%', height: '100%' }} nativeControls contentFit="contain" />;
+}
+
+type MediaItem = { uri: string; name: string; mimeType: string };
+
+function MediaViewer({ media, onClose, onExternal }: { media: MediaItem; onClose: () => void; onExternal: () => void }) {
+  const mime = (media.mimeType || '').toLowerCase();
+  const isAudio = mime.startsWith('audio');
+  const isPdf = mime === 'application/pdf';
+  let body: React.ReactNode;
+  if (Platform.OS === 'web') {
+    if (isPdf) body = React.createElement('iframe', { src: media.uri, style: { width: '100%', height: '100%', border: 'none', backgroundColor: '#ffffff' } });
+    else if (isAudio) body = React.createElement('audio', { src: media.uri, controls: true, autoPlay: true, style: { width: '90%', maxWidth: 520 } });
+    else body = React.createElement('video', { src: media.uri, controls: true, autoPlay: true, playsInline: true, style: { width: '100%', height: '100%', backgroundColor: '#000000' } });
+  } else if (ExpoVideoModule?.useVideoPlayer && !isPdf) {
+    body = <NativeMediaPlayer uri={media.uri} />;
+  } else {
+    body = (
+      <View style={{ padding: 28, alignItems: 'center' }}>
+        <Ionicons name={isAudio ? 'musical-notes-outline' : 'document-text-outline'} size={54} color="#ffffff" />
+        <Text style={{ color: '#ffffff', fontSize: 15, textAlign: 'center', marginTop: 16, lineHeight: 22 }}>
+          Tap the button below to open this file in an app on your phone.
+        </Text>
+        <Pressable onPress={onExternal} style={{ marginTop: 20, height: 48, borderRadius: 24, paddingHorizontal: 26, alignItems: 'center', justifyContent: 'center', backgroundColor: '#ffffff' }}>
+          <Text style={{ color: '#000000', fontWeight: '800', fontSize: 15 }}>Open file</Text>
+        </Pressable>
+        <Text style={{ color: '#9a9a9f', fontSize: 12, textAlign: 'center', marginTop: 18, lineHeight: 18 }}>
+          To play video and audio inside IK TECH AI, run: npx expo install expo-video
+        </Text>
+      </View>
+    );
+  }
+  return (
+    <View style={{ flex: 1, backgroundColor: '#000000', paddingTop: Platform.OS === 'web' ? 18 : 44 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingBottom: 10 }}>
+        <Pressable onPress={onClose} style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: '#2a2a2c' }} accessibilityLabel="Close">
+          <Ionicons name="close" size={24} color="#ffffff" />
+        </Pressable>
+        <Text style={{ flex: 1, color: '#ffffff', fontSize: 15, fontWeight: '700', marginLeft: 12 }} numberOfLines={1}>{media.name}</Text>
+      </View>
+      <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>{body}</View>
+    </View>
+  );
+}
+
+// ───────────────── Crop editor (replaces the old “Resize 75% / 50% / 25%”) ─────────────────
+const CROP_RATIOS: { label: string; value: number | null }[] = [
+  { label: 'Free', value: null },
+  { label: '1:1', value: 1 },
+  { label: '4:3', value: 4 / 3 },
+  { label: '3:4', value: 3 / 4 },
+  { label: '16:9', value: 16 / 9 },
+];
+
+type CropRect = { x: number; y: number; w: number; h: number };
+const cropClamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+const applyCropGesture = (mode: string, start: CropRect, dx: number, dy: number, disp: { w: number; h: number }, ratio: number | null): CropRect => {
+  const MIN = 48;
+  if (mode === 'move') {
+    return { x: cropClamp(start.x + dx, 0, disp.w - start.w), y: cropClamp(start.y + dy, 0, disp.h - start.h), w: start.w, h: start.h };
+  }
+  const left = mode === 'tl' || mode === 'bl';
+  const top = mode === 'tl' || mode === 'tr';
+  const fixedX = left ? start.x + start.w : start.x;
+  const fixedY = top ? start.y + start.h : start.y;
+  const movingX = left ? start.x + dx : start.x + start.w + dx;
+  const movingY = top ? start.y + dy : start.y + start.h + dy;
+  const roomX = left ? fixedX : disp.w - fixedX;
+  const roomY = top ? fixedY : disp.h - fixedY;
+  let w = cropClamp(Math.abs(movingX - fixedX), MIN, Math.max(MIN, roomX));
+  let h = cropClamp(Math.abs(movingY - fixedY), MIN, Math.max(MIN, roomY));
+  if (ratio) {
+    h = w / ratio;
+    if (h > roomY) { h = roomY; w = h * ratio; }
+    if (w > roomX) { w = roomX; h = w / ratio; }
+  }
+  return { x: left ? fixedX - w : fixedX, y: top ? fixedY - h : fixedY, w, h };
+};
+
+function CropEditor({ uri, onCancel, onDone }: { uri: string; onCancel: () => void; onDone: (dataUrl: string) => void }) {
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+  const [area, setArea] = useState({ w: 0, h: 0 });
+  const [rect, setRect] = useState<CropRect>({ x: 0, y: 0, w: 0, h: 0 });
+  const [ratio, setRatio] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    Image.getSize(uri, (w, h) => setNatural({ w, h }), () => Alert.alert('Could not open image', 'This image could not be read.'));
+  }, [uri]);
+
+  const disp = useMemo(() => {
+    if (!natural || !area.w || !area.h) return null;
+    const scale = Math.min(area.w / natural.w, area.h / natural.h);
+    const w = natural.w * scale; const h = natural.h * scale;
+    return { w, h, x: (area.w - w) / 2, y: (area.h - h) / 2, scale };
+  }, [natural, area]);
+
+  useEffect(() => {
+    if (disp) setRect({ x: 0, y: 0, w: disp.w, h: disp.h });
+  }, [disp?.w, disp?.h]);
+
+  const rectRef = useRef(rect); rectRef.current = rect;
+  const dispRef = useRef(disp); dispRef.current = disp;
+  const ratioRef = useRef(ratio); ratioRef.current = ratio;
+  const startRef = useRef<CropRect>(rect);
+
+  const responders = useMemo(() => {
+    const make = (mode: string) => PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: () => { startRef.current = { ...rectRef.current }; },
+      onPanResponderMove: (_event, gesture) => {
+        const d = dispRef.current;
+        if (!d) return;
+        setRect(applyCropGesture(mode, startRef.current, gesture.dx, gesture.dy, d, ratioRef.current));
+      },
+    });
+    return { move: make('move'), tl: make('tl'), tr: make('tr'), bl: make('bl'), br: make('br') };
+  }, []);
+
+  const chooseRatio = (value: number | null) => {
+    setRatio(value);
+    if (!disp || !value) return;
+    const w0 = Math.min(disp.w, disp.h * value) * 0.92;
+    const h0 = w0 / value;
+    setRect({ x: (disp.w - w0) / 2, y: (disp.h - h0) / 2, w: w0, h: h0 });
+  };
+
+  const finish = async () => {
+    if (!disp || !natural) return;
+    const originX = Math.round(cropClamp(rect.x / disp.scale, 0, natural.w - 1));
+    const originY = Math.round(cropClamp(rect.y / disp.scale, 0, natural.h - 1));
+    const width = Math.round(cropClamp(rect.w / disp.scale, 1, natural.w - originX));
+    const height = Math.round(cropClamp(rect.h / disp.scale, 1, natural.h - originY));
+    try {
+      setBusy(true);
+      if (ImageManipulatorModule?.manipulateAsync) {
+        const result = await ImageManipulatorModule.manipulateAsync(uri, [{ crop: { originX, originY, width, height } }], { compress: 0.92, format: 'jpeg', base64: true });
+        onDone(`data:image/jpeg;base64,${result.base64}`);
+        return;
+      }
+      const browser: any = globalThis as any;
+      if (Platform.OS === 'web' && browser.document) {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const img = new browser.Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = () => {
+            const canvas = browser.document.createElement('canvas');
+            canvas.width = width; canvas.height = height;
+            const context = canvas.getContext('2d');
+            if (!context) { reject(new Error('no-canvas')); return; }
+            context.drawImage(img, originX, originY, width, height, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', 0.92));
+          };
+          img.onerror = () => reject(new Error('load-failed'));
+          img.src = uri;
+        });
+        onDone(dataUrl);
+        return;
+      }
+      Alert.alert('Crop needs a package', 'Run this, then rebuild the app:\nnpx expo install expo-image-manipulator');
+    } catch (_error) {
+      Alert.alert('Could not crop', 'Please try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSize = 44;
+  const corner = (mode: 'tl' | 'tr' | 'bl' | 'br') => {
+    const isLeft = mode === 'tl' || mode === 'bl';
+    const isTop = mode === 'tl' || mode === 'tr';
+    return (
+      <View
+        key={mode}
+        {...responders[mode].panHandlers}
+        style={{ position: 'absolute', width: handleSize, height: handleSize, left: isLeft ? -handleSize / 2 : undefined, right: isLeft ? undefined : -handleSize / 2, top: isTop ? -handleSize / 2 : undefined, bottom: isTop ? undefined : -handleSize / 2, alignItems: isLeft ? 'flex-start' : 'flex-end', justifyContent: isTop ? 'flex-start' : 'flex-end' }}
+      >
+        <View style={{ width: 26, height: 26, margin: handleSize / 2 - 13, borderColor: '#ffffff', borderTopWidth: isTop ? 4 : 0, borderBottomWidth: isTop ? 0 : 4, borderLeftWidth: isLeft ? 4 : 0, borderRightWidth: isLeft ? 0 : 4 }} />
+      </View>
+    );
+  };
+
+  return (
+    <View style={{ flex: 1, backgroundColor: '#000000', paddingTop: Platform.OS === 'web' ? 18 : 44 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, marginBottom: 10 }}>
+        <Pressable onPress={onCancel} style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: '#2a2a2c' }} accessibilityLabel="Cancel crop">
+          <Ionicons name="close" size={24} color="#ffffff" />
+        </Pressable>
+        <Text style={{ flex: 1, textAlign: 'center', color: '#ffffff', fontSize: 16, fontWeight: '800' }}>Crop</Text>
+        <Pressable onPress={finish} disabled={busy || !disp} style={{ height: 44, borderRadius: 22, paddingHorizontal: 22, justifyContent: 'center', backgroundColor: '#ffffff' }} accessibilityLabel="Save crop">
+          {busy ? <ActivityIndicator color="#000000" /> : <Text style={{ color: '#000000', fontWeight: '800', fontSize: 15 }}>Save</Text>}
+        </Pressable>
+      </View>
+
+      <View style={{ flex: 1 }} onLayout={(event) => setArea({ w: event.nativeEvent.layout.width, h: event.nativeEvent.layout.height })}>
+        {disp ? (
+          <View style={{ position: 'absolute', left: disp.x, top: disp.y, width: disp.w, height: disp.h }}>
+            <Image source={{ uri }} style={{ width: disp.w, height: disp.h }} resizeMode="stretch" />
+            <View pointerEvents="none" style={{ position: 'absolute', left: 0, top: 0, width: disp.w, height: rect.y, backgroundColor: 'rgba(0,0,0,0.6)' }} />
+            <View pointerEvents="none" style={{ position: 'absolute', left: 0, top: rect.y + rect.h, width: disp.w, height: Math.max(0, disp.h - rect.y - rect.h), backgroundColor: 'rgba(0,0,0,0.6)' }} />
+            <View pointerEvents="none" style={{ position: 'absolute', left: 0, top: rect.y, width: rect.x, height: rect.h, backgroundColor: 'rgba(0,0,0,0.6)' }} />
+            <View pointerEvents="none" style={{ position: 'absolute', left: rect.x + rect.w, top: rect.y, width: Math.max(0, disp.w - rect.x - rect.w), height: rect.h, backgroundColor: 'rgba(0,0,0,0.6)' }} />
+            <View {...responders.move.panHandlers} style={{ position: 'absolute', left: rect.x, top: rect.y, width: rect.w, height: rect.h, borderWidth: 1.5, borderColor: '#ffffff' }}>
+              <View pointerEvents="none" style={{ position: 'absolute', left: '33.3%', top: 0, bottom: 0, width: 1, backgroundColor: 'rgba(255,255,255,0.45)' }} />
+              <View pointerEvents="none" style={{ position: 'absolute', left: '66.6%', top: 0, bottom: 0, width: 1, backgroundColor: 'rgba(255,255,255,0.45)' }} />
+              <View pointerEvents="none" style={{ position: 'absolute', top: '33.3%', left: 0, right: 0, height: 1, backgroundColor: 'rgba(255,255,255,0.45)' }} />
+              <View pointerEvents="none" style={{ position: 'absolute', top: '66.6%', left: 0, right: 0, height: 1, backgroundColor: 'rgba(255,255,255,0.45)' }} />
+              {corner('tl')}{corner('tr')}{corner('bl')}{corner('br')}
+            </View>
+          </View>
+        ) : <ActivityIndicator color="#ffffff" style={{ marginTop: 40 }} />}
+      </View>
+
+      <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 8, paddingTop: 12, paddingBottom: Platform.OS === 'web' ? 18 : 30, paddingHorizontal: 10 }}>
+        {CROP_RATIOS.map((item) => {
+          const active = item.value === ratio;
+          return (
+            <Pressable key={item.label} onPress={() => chooseRatio(item.value)} style={{ minWidth: 56, height: 38, borderRadius: 19, paddingHorizontal: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: active ? '#ffffff' : '#2a2a2c' }}>
+              <Text style={{ color: active ? '#000000' : '#ffffff', fontSize: 14, fontWeight: '800' }}>{item.label}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
 
 // ───────────────── Downloads / opening files (optional packages, graceful fallbacks) ─────────────────
 let FileSystemModule: any = null;
@@ -715,364 +1067,273 @@ function getNigeriaDateTimeAnswer(question: string): string | null {
   return `Today in Nigeria is ${date}.`;
 }
 
-function renderInlineMarkdown(
-  text: string,
-): React.ReactNode[] {
+// ───────────────── AI reply text: rendered like Claude (headings, lists, tables, code blocks, links) ─────────────────
+const mdColors = (isUser: boolean) => {
+  if (isUser) {
+    return { text: '#ffffff', heading: '#ffffff', muted: '#e2ecf7', codeBg: 'rgba(0,0,0,0.25)', codeBorder: 'rgba(255,255,255,0.25)', codeHead: 'rgba(0,0,0,0.25)', codeText: '#ffffff', inlineBg: 'rgba(0,0,0,0.25)', inlineText: '#ffffff', link: '#ffffff', border: 'rgba(255,255,255,0.35)', tableHead: 'rgba(0,0,0,0.2)', quote: 'rgba(255,255,255,0.6)', bullet: '#ffffff' };
+  }
+  return uiLightMode
+    ? { text: '#1f2937', heading: '#0f172a', muted: '#526176', codeBg: '#f3f6fa', codeBorder: '#d5deea', codeHead: '#e6edf6', codeText: '#1e293b', inlineBg: '#e8eef6', inlineText: '#0b5cad', link: '#1d6fd1', border: '#d5deea', tableHead: '#eaf0f8', quote: '#9fb0c6', bullet: '#526176' }
+    : { text: '#e8eef7', heading: '#ffffff', muted: '#91a8c3', codeBg: '#07111d', codeBorder: '#1c3854', codeHead: '#0d2238', codeText: '#d7e8ff', inlineBg: '#16283d', inlineText: '#9ccaff', link: '#6eb4ff', border: '#1c3854', tableHead: '#0d2238', quote: '#3973ad', bullet: '#91a8c3' };
+};
+
+const MONO_FONT = Platform.OS === 'ios' ? 'Menlo' : 'monospace';
+
+type MdColors = ReturnType<typeof mdColors>;
+
+function renderInlineMarkdown(text: string, c: MdColors, keyPrefix = 'i'): React.ReactNode[] {
   const parts: React.ReactNode[] = [];
-
-  const regex =
-    /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|~[^~]+~|\*[^*]+\*|_[^_]+_)/g;
-
+  const regex = /(`[^`\n]+`|\*\*[\s\S]+?\*\*|__[\s\S]+?__|~~[\s\S]+?~~|\[[^\]\n]+\]\([^)\s]+\)|https?:\/\/[^\s)<>]+|\*[^*\n]+\*|_[^_\n]+_)/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   let key = 0;
+  const isWordChar = (ch: string | undefined) => !!ch && /[A-Za-z0-9]/.test(ch);
 
   while ((match = regex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push(
-        <Text key={`plain-${key++}`}>
-          {text.slice(lastIndex, match.index)}
-        </Text>,
-      );
-    }
-
     const token = match[0];
+    const before = text[match.index - 1];
+    const after = text[match.index + token.length];
+    // underscores inside words (snake_case) are not italic
+    if (token.startsWith('_') && !token.startsWith('__') && (isWordChar(before) || isWordChar(after))) continue;
+    if (token.startsWith('__') && (isWordChar(before) || isWordChar(after))) continue;
 
-    if (
-      token.startsWith('**') &&
-      token.endsWith('**')
-    ) {
+    if (match.index > lastIndex) parts.push(<Text key={`${keyPrefix}-p${key++}`}>{text.slice(lastIndex, match.index)}</Text>);
+
+    if (token.startsWith('`')) {
       parts.push(
-        <Text
-          key={`bold-${key++}`}
-          style={baseStyles.markdownBold}
-        >
-          {token.slice(2, -2)}
+        <Text key={`${keyPrefix}-c${key++}`} style={{ fontFamily: MONO_FONT, fontSize: 13.5, backgroundColor: c.inlineBg, color: c.inlineText }}>
+          {` ${token.slice(1, -1)} `}
         </Text>,
       );
-    } else if (
-      token.startsWith('__') &&
-      token.endsWith('__')
-    ) {
+    } else if (token.startsWith('**') || token.startsWith('__')) {
+      parts.push(<Text key={`${keyPrefix}-b${key++}`} style={{ fontWeight: '800', color: c.heading }}>{renderInlineMarkdown(token.slice(2, -2), c, `${keyPrefix}b${key}`)}</Text>);
+    } else if (token.startsWith('~~')) {
+      parts.push(<Text key={`${keyPrefix}-s${key++}`} style={{ textDecorationLine: 'line-through' }}>{renderInlineMarkdown(token.slice(2, -2), c, `${keyPrefix}s${key}`)}</Text>);
+    } else if (token.startsWith('[')) {
+      const linkMatch = token.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
+      const label = linkMatch ? linkMatch[1] : token;
+      const url = linkMatch ? linkMatch[2] : '';
       parts.push(
-        <Text
-          key={`bold-${key++}`}
-          style={baseStyles.markdownBold}
-        >
-          {token.slice(2, -2)}
+        <Text key={`${keyPrefix}-l${key++}`} style={{ color: c.link, textDecorationLine: 'underline' }} onPress={() => { if (url) Linking.openURL(url).catch(() => {}); }}>
+          {label}
         </Text>,
       );
-    } else if (
-      token.startsWith('~~') &&
-      token.endsWith('~~')
-    ) {
+    } else if (token.startsWith('http')) {
       parts.push(
-        <Text
-          key={`strike-${key++}`}
-          style={baseStyles.markdownStrike}
-        >
-          {token.slice(2, -2)}
-        </Text>,
-      );
-    } else if (
-      token.startsWith('~') &&
-      token.endsWith('~')
-    ) {
-      parts.push(
-        <Text
-          key={`strike-${key++}`}
-          style={baseStyles.markdownStrike}
-        >
-          {token.slice(1, -1)}
-        </Text>,
-      );
-    } else if (
-      token.startsWith('`') &&
-      token.endsWith('`')
-    ) {
-      parts.push(
-        <Text
-          key={`code-${key++}`}
-          style={baseStyles.markdownCode}
-        >
-          {token.slice(1, -1)}
-        </Text>,
-      );
-    } else if (
-      token.startsWith('*') &&
-      token.endsWith('*')
-    ) {
-      parts.push(
-        <Text
-          key={`italic-${key++}`}
-          style={baseStyles.markdownItalic}
-        >
-          {token.slice(1, -1)}
-        </Text>,
-      );
-    } else if (
-      token.startsWith('_') &&
-      token.endsWith('_')
-    ) {
-      parts.push(
-        <Text
-          key={`italic-${key++}`}
-          style={baseStyles.markdownItalic}
-        >
-          {token.slice(1, -1)}
-        </Text>,
-      );
-    } else {
-      parts.push(
-        <Text key={`text-${key++}`}>
+        <Text key={`${keyPrefix}-u${key++}`} style={{ color: c.link, textDecorationLine: 'underline' }} onPress={() => { Linking.openURL(token).catch(() => {}); }}>
           {token}
         </Text>,
       );
+    } else {
+      parts.push(<Text key={`${keyPrefix}-i${key++}`} style={{ fontStyle: 'italic' }}>{renderInlineMarkdown(token.slice(1, -1), c, `${keyPrefix}i${key}`)}</Text>);
     }
-
-    lastIndex =
-      match.index + token.length;
+    lastIndex = match.index + token.length;
   }
-
-  if (lastIndex < text.length) {
-    parts.push(
-      <Text key={`plain-${key++}`}>
-        {text.slice(lastIndex)}
-      </Text>,
-    );
-  }
-
+  if (lastIndex < text.length) parts.push(<Text key={`${keyPrefix}-p${key++}`}>{text.slice(lastIndex)}</Text>);
   return parts;
 }
 
 // A box that holds ONLY the text the user asked to copy, with its own Copy button.
 function CopyBlock({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
+  const c = mdColors(false);
   const handleCopy = async () => {
     try {
       if (ClipboardModule?.setStringAsync) await ClipboardModule.setStringAsync(text);
       else await Share.share({ message: text });
       setCopied(true);
+      showToast('Copied to clipboard', 'copy-outline');
       setTimeout(() => setCopied(false), 1500);
     } catch (_error) { /* ignore */ }
   };
   return (
-    <View style={{ width: '100%', marginVertical: 8, borderRadius: 12, backgroundColor: '#07111d', borderWidth: 1, borderColor: '#1c3854', overflow: 'hidden' }}>
-      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 8, backgroundColor: '#0d2238' }}>
-        <Text style={{ color: '#91a8c3', fontSize: 12, fontWeight: '700' }}>Text to copy</Text>
-        <Pressable onPress={handleCopy} hitSlop={8} accessibilityLabel="Copy this text" style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 4, paddingHorizontal: 10, borderRadius: 14, backgroundColor: copied ? '#1f7a4d' : '#2563a8' }}>
+    <View style={{ width: '100%', marginVertical: 8, borderRadius: 12, backgroundColor: c.codeBg, borderWidth: 1, borderColor: c.codeBorder, overflow: 'hidden' }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 8, backgroundColor: c.codeHead }}>
+        <Text style={{ color: c.muted, fontSize: 12, fontWeight: '700' }}>Text to copy</Text>
+        <Pressable onPress={handleCopy} hitSlop={8} accessibilityLabel="Copy this text" style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 4, paddingHorizontal: 10, borderRadius: 14, backgroundColor: '#2563a8' }}>
           <Ionicons name={copied ? 'checkmark' : 'copy-outline'} size={15} color="#ffffff" />
           <Text style={{ color: '#ffffff', fontSize: 13, fontWeight: '800', marginLeft: 5 }}>{copied ? 'Copied' : 'Copy'}</Text>
         </Pressable>
       </View>
-      <Text selectable style={{ color: '#e6f1ff', fontSize: 15, lineHeight: 22, padding: 12 }}>{text}</Text>
+      <Text selectable style={{ color: c.text, fontSize: 15, lineHeight: 22, padding: 12 }}>{text}</Text>
     </View>
   );
 }
 
-function renderMarkdown(
-  text: string,
-): React.ReactNode {
-  const lines = text.split('\n');
-  const result: React.ReactNode[] = [];
+function CodeBlock({ code, lang, c }: { code: string; lang: string; c: MdColors }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = async () => {
+    try {
+      if (ClipboardModule?.setStringAsync) await ClipboardModule.setStringAsync(code);
+      else await Share.share({ message: code });
+      setCopied(true);
+      showToast('Code copied', 'copy-outline');
+      setTimeout(() => setCopied(false), 1500);
+    } catch (_error) { /* ignore */ }
+  };
+  return (
+    <View style={{ width: '100%', marginVertical: 8, borderRadius: 12, backgroundColor: c.codeBg, borderWidth: 1, borderColor: c.codeBorder, overflow: 'hidden' }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingLeft: 12, paddingRight: 6, paddingVertical: 4, backgroundColor: c.codeHead }}>
+        <Text style={{ color: c.muted, fontSize: 12, fontWeight: '700' }}>{lang || 'code'}</Text>
+        <Pressable onPress={handleCopy} hitSlop={8} accessibilityLabel="Copy code" style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 6, paddingHorizontal: 8 }}>
+          <Ionicons name={copied ? 'checkmark' : 'copy-outline'} size={15} color={c.muted} />
+          <Text style={{ color: c.muted, fontSize: 12, fontWeight: '700', marginLeft: 5 }}>{copied ? 'Copied' : 'Copy'}</Text>
+        </Pressable>
+      </View>
+      <ScrollView horizontal showsHorizontalScrollIndicator>
+        <Text selectable style={{ color: c.codeText, fontFamily: MONO_FONT, fontSize: 13, lineHeight: 20, padding: 12 }}>{code}</Text>
+      </ScrollView>
+    </View>
+  );
+}
 
-  let inCodeBlock = false;
-  let codeLines: string[] = [];
-  let codeKey = 0;
-  let codeLang = '';
+const splitTableRow = (line: string): string[] => {
+  let row = line.trim();
+  if (row.startsWith('|')) row = row.slice(1);
+  if (row.endsWith('|')) row = row.slice(0, -1);
+  return row.split('|').map((cell) => cell.trim());
+};
+const TABLE_SEPARATOR = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
 
-  lines.forEach((line, index) => {
+function renderMarkdown(text: string, isUser = false): React.ReactNode {
+  const c = mdColors(isUser);
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const blocks: React.ReactNode[] = [];
+  const baseText = { color: c.text, fontSize: 16, lineHeight: 25 } as const;
+  let i = 0;
+  let k = 0;
+
+  const isSpecialLine = (line: string, next?: string) => {
+    const t = line.trim();
+    return (
+      t.startsWith('```') ||
+      /^#{1,6}\s+/.test(t) ||
+      /^([-*_])(\s*\1){2,}$/.test(t) ||
+      /^\s*([-*+]|\d+[.)])\s+/.test(line) ||
+      /^>\s?/.test(t) ||
+      (t.includes('|') && !!next && TABLE_SEPARATOR.test(next) && next.includes('-'))
+    );
+  };
+
+  while (i < lines.length) {
+    const line = lines[i];
     const trimmed = line.trim();
 
-    if (
-      trimmed.startsWith('```')
-    ) {
-      if (!inCodeBlock) {
-        inCodeBlock = true;
-        codeLines = [];
-        codeLang = trimmed.slice(3).trim().toLowerCase();
-      } else {
-        result.push(
-          codeLang === 'copy' ? (
-            <CopyBlock key={`copy-block-${codeKey++}`} text={codeLines.join('\n').trim()} />
-          ) : (
-          <View
-            key={`code-block-${codeKey++}`}
-            style={baseStyles.codeBlock}
-          >
-            <Text style={baseStyles.codeBlockText}>
-              {codeLines.join('\n')}
-            </Text>
-          </View>
-          ),
-        );
+    if (!trimmed) { i += 1; continue; }
 
-        inCodeBlock = false;
-        codeLines = [];
-      }
-
-      return;
+    // fenced code block (also while the answer is still streaming)
+    if (trimmed.startsWith('```')) {
+      const lang = trimmed.slice(3).trim().toLowerCase();
+      const codeLines: string[] = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trim().startsWith('```')) { codeLines.push(lines[i]); i += 1; }
+      i += 1; // closing fence
+      const code = codeLines.join('\n');
+      blocks.push(lang === 'copy'
+        ? <CopyBlock key={`b${k++}`} text={code.trim()} />
+        : <CodeBlock key={`b${k++}`} code={code} lang={lang} c={c} />);
+      continue;
     }
 
-    if (inCodeBlock) {
-      codeLines.push(line);
-      return;
-    }
-
-    if (!trimmed) {
-      result.push(
-        <View
-          key={`space-${index}`}
-          style={baseStyles.markdownSpacer}
-        />,
-      );
-
-      return;
-    }
-
-    const headingMatch =
-      trimmed.match(
-        /^(#{1,3})\s+(.*)$/,
-      );
-
-    if (headingMatch) {
-      const level =
-        headingMatch[1].length;
-      const headingText =
-        headingMatch[2];
-
-      result.push(
-        <Text
-          key={`heading-${index}`}
-          style={
-            level === 1
-              ? baseStyles.markdownH1
-              : level === 2
-                ? baseStyles.markdownH2
-                : baseStyles.markdownH3
-          }
-        >
-          {renderInlineMarkdown(
-            headingText,
-          )}
+    // headings
+    const heading = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      const level = heading[1].length;
+      const size = level === 1 ? 24 : level === 2 ? 21 : level === 3 ? 18 : 16.5;
+      blocks.push(
+        <Text key={`b${k++}`} style={{ color: c.heading, fontSize: size, lineHeight: size + 8, fontWeight: '800', marginTop: blocks.length ? 14 : 0, marginBottom: 6 }}>
+          {renderInlineMarkdown(heading[2].replace(/\s+#+\s*$/, ''), c, `h${k}`)}
         </Text>,
       );
-
-      return;
+      i += 1;
+      continue;
     }
 
-    const bulletMatch =
-      trimmed.match(
-        /^[-*+]\s+(.*)$/,
+    // horizontal rule
+    if (/^([-*_])(\s*\1){2,}$/.test(trimmed)) {
+      blocks.push(<View key={`b${k++}`} style={{ height: 1, backgroundColor: c.border, marginVertical: 14 }} />);
+      i += 1;
+      continue;
+    }
+
+    // table
+    if (trimmed.includes('|') && i + 1 < lines.length && TABLE_SEPARATOR.test(lines[i + 1]) && lines[i + 1].includes('-')) {
+      const header = splitTableRow(lines[i]);
+      const aligns = splitTableRow(lines[i + 1]).map((cell) => (cell.startsWith(':') && cell.endsWith(':') ? 'center' : cell.endsWith(':') ? 'right' : 'left'));
+      const rows: string[][] = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim() && lines[i].includes('|')) { rows.push(splitTableRow(lines[i])); i += 1; }
+      const columns = header.length;
+      const widths = header.map((cell, index) => {
+        const longest = Math.max(cell.length, ...rows.map((row) => (row[index] || '').length));
+        return cropClamp(longest * 8 + 24, 84, 260);
+      });
+      const renderRow = (cells: string[], isHeader: boolean, rowIndex: number) => (
+        <View key={`r${rowIndex}`} style={{ flexDirection: 'row', backgroundColor: isHeader ? c.tableHead : 'transparent', borderTopWidth: rowIndex > 0 ? 1 : 0, borderColor: c.border }}>
+          {Array.from({ length: columns }).map((_unused, index) => (
+            <View key={index} style={{ width: widths[index], paddingHorizontal: 10, paddingVertical: 8, borderLeftWidth: index > 0 ? 1 : 0, borderColor: c.border }}>
+              <Text style={{ color: c.text, fontSize: 14, lineHeight: 20, fontWeight: isHeader ? '800' : '400', textAlign: aligns[index] as any }}>
+                {renderInlineMarkdown(cells[index] || '', c, `t${rowIndex}-${index}`)}
+              </Text>
+            </View>
+          ))}
+        </View>
       );
+      blocks.push(
+        <ScrollView key={`b${k++}`} horizontal showsHorizontalScrollIndicator style={{ marginVertical: 8 }}>
+          <View style={{ borderWidth: 1, borderColor: c.border, borderRadius: 10, overflow: 'hidden' }}>
+            {renderRow(header, true, 0)}
+            {rows.map((row, index) => renderRow(row, false, index + 1))}
+          </View>
+        </ScrollView>,
+      );
+      continue;
+    }
 
-    if (bulletMatch) {
-      result.push(
-        <View
-          key={`bullet-${index}`}
-          style={baseStyles.markdownListRow}
-        >
-          <Text style={baseStyles.markdownBullet}>
-            •
-          </Text>
+    // lists (bullets, numbers, nested by indentation)
+    if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
+      const items: React.ReactNode[] = [];
+      while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) {
+        const m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/)!;
+        const indent = Math.min(4, Math.floor(m[1].replace(/\t/g, '  ').length / 2));
+        const ordered = /\d/.test(m[2]);
+        const marker = ordered ? m[2].replace(')', '.') : indent === 0 ? '•' : indent === 1 ? '◦' : '▪';
+        items.push(
+          <View key={`li${i}`} style={{ flexDirection: 'row', alignItems: 'flex-start', marginLeft: indent * 18, marginBottom: 5 }}>
+            <Text style={{ ...baseText, color: c.bullet, width: ordered ? 26 : 18, fontWeight: ordered ? '700' : '400' }}>{marker}</Text>
+            <Text style={{ ...baseText, flex: 1 }}>{renderInlineMarkdown(m[3], c, `li${i}`)}</Text>
+          </View>,
+        );
+        i += 1;
+      }
+      blocks.push(<View key={`b${k++}`} style={{ marginBottom: 8 }}>{items}</View>);
+      continue;
+    }
 
-          <Text
-            style={[
-              baseStyles.markdownText,
-              baseStyles.markdownListText,
-            ]}
-          >
-            {renderInlineMarkdown(
-              bulletMatch[1],
-            )}
-          </Text>
+    // block quote
+    if (/^>\s?/.test(trimmed)) {
+      const quoteLines: string[] = [];
+      while (i < lines.length && /^>\s?/.test(lines[i].trim())) { quoteLines.push(lines[i].trim().replace(/^>\s?/, '')); i += 1; }
+      blocks.push(
+        <View key={`b${k++}`} style={{ borderLeftWidth: 3, borderLeftColor: c.quote, paddingLeft: 12, marginVertical: 6 }}>
+          <Text style={{ ...baseText, color: c.muted }}>{renderInlineMarkdown(quoteLines.join('\n'), c, `q${k}`)}</Text>
         </View>,
       );
-
-      return;
+      continue;
     }
 
-    const numberedMatch =
-      trimmed.match(
-        /^(\d+)[.)]\s+(.*)$/,
-      );
-
-    if (numberedMatch) {
-      result.push(
-        <View
-          key={`number-${index}`}
-          style={baseStyles.markdownListRow}
-        >
-          <Text style={baseStyles.markdownNumber}>
-            {numberedMatch[1]}.
-          </Text>
-
-          <Text
-            style={[
-              baseStyles.markdownText,
-              baseStyles.markdownListText,
-            ]}
-          >
-            {renderInlineMarkdown(
-              numberedMatch[2],
-            )}
-          </Text>
-        </View>,
-      );
-
-      return;
-    }
-
-    const quoteMatch =
-      trimmed.match(
-        /^>\s?(.*)$/,
-      );
-
-    if (quoteMatch) {
-      result.push(
-        <View
-          key={`quote-${index}`}
-          style={baseStyles.markdownQuote}
-        >
-          <Text style={baseStyles.markdownText}>
-            {renderInlineMarkdown(
-              quoteMatch[1],
-            )}
-          </Text>
-        </View>,
-      );
-
-      return;
-    }
-
-    result.push(
-      <Text
-        key={`line-${index}`}
-        style={baseStyles.markdownText}
-      >
-        {renderInlineMarkdown(line)}
+    // paragraph: keeps going until a blank line or another block starts
+    const paragraph: string[] = [line];
+    i += 1;
+    while (i < lines.length && lines[i].trim() && !isSpecialLine(lines[i], lines[i + 1])) { paragraph.push(lines[i]); i += 1; }
+    blocks.push(
+      <Text key={`b${k++}`} style={{ ...baseText, marginBottom: 10 }}>
+        {renderInlineMarkdown(paragraph.join('\n'), c, `p${k}`)}
       </Text>,
-    );
-  });
-
-  if (inCodeBlock && codeLines.length) {
-    result.push(
-      codeLang === 'copy' ? (
-        <CopyBlock key={`copy-block-open-${codeKey++}`} text={codeLines.join('\n').trim()} />
-      ) : (
-      <View
-        key={`code-block-open-${codeKey++}`}
-        style={baseStyles.codeBlock}
-      >
-        <Text style={baseStyles.codeBlockText}>
-          {codeLines.join('\n')}
-        </Text>
-      </View>
-      ),
     );
   }
 
-  return <>{result}</>;
+  return <View>{blocks}</View>;
 }
 
 const ATTACHMENT_TYPES: Record<string, string> = {
@@ -1181,6 +1442,7 @@ function MessageBubble({
   onSpeak,
   onShare,
   onMore,
+  onOpenAttachment,
 }: {
   message: ChatMessage;
   onOpenImage: (uri: string) => void;
@@ -1194,6 +1456,7 @@ function MessageBubble({
   onSpeak?: (message: ChatMessage) => void;
   onShare?: (message: ChatMessage) => void;
   onMore?: (message: ChatMessage) => void;
+  onOpenAttachment?: (attachment: any) => void;
 }) {
   const isUser =
     message.role === 'user';
@@ -1205,26 +1468,33 @@ function MessageBubble({
     <View>
       <View
         style={[
-          baseStyles.messageRow,
+          S().messageRow,
           isUser
-            ? baseStyles.userMessageRow
-            : baseStyles.assistantMessageRow,
+            ? S().userMessageRow
+            : S().assistantMessageRow,
         ]}
       >
         <View
           style={[
-            baseStyles.messageBubble,
+            S().messageBubble,
             isUser
-              ? baseStyles.userBubble
-              : baseStyles.assistantBubble,
+              ? S().userBubble
+              : S().assistantBubble,
             isUser && accentColor ? { backgroundColor: accentColor } : null,
+            !isUser ? { backgroundColor: 'transparent', borderWidth: 0, maxWidth: '100%', paddingHorizontal: 2 } : null,
           ]}
         >
           {message.attachment ? (
-            <View style={{ flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', maxWidth: '100%', marginBottom: 8, paddingVertical: 8, paddingHorizontal: 10, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.22)' }}>
+            <Pressable
+              onPress={() => onOpenAttachment?.(message.attachment)}
+              accessibilityRole="button"
+              accessibilityLabel="Open attached file"
+              style={{ flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', maxWidth: '100%', marginBottom: 8, paddingVertical: 8, paddingHorizontal: 10, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.22)' }}
+            >
               <Ionicons name={message.attachment.mimeType.startsWith('video') ? 'videocam-outline' : message.attachment.mimeType.startsWith('audio') ? 'musical-notes-outline' : 'document-text-outline'} size={20} color="#ffffff" style={{ marginRight: 8 }} />
               <Text style={{ color: '#ffffff', fontSize: 13, fontWeight: '600', flexShrink: 1 }} numberOfLines={1}>{message.attachment.name}</Text>
-            </View>
+              <Ionicons name="open-outline" size={16} color="#ffffff" style={{ marginLeft: 8 }} />
+            </Pressable>
           ) : null}
           {message.image ? (
             <Pressable
@@ -1235,16 +1505,14 @@ function MessageBubble({
             >
               <Image
                 source={{ uri: message.image.uri }}
-                style={baseStyles.messageImage as React.ComponentProps<typeof Image>['style']}
+                style={S().messageImage as React.ComponentProps<typeof Image>['style']}
                 resizeMode="contain"
               />
             </Pressable>
           ) : null}
 
-          <View style={baseStyles.messageContent}>
-            {renderMarkdown(
-              message.content,
-            )}
+          <View style={S().messageContent}>
+            {renderMarkdown(message.content, isUser)}
           </View>
         </View>
       </View>
@@ -1288,21 +1556,21 @@ function TypingIndicator() {
   return (
     <View
       style={[
-        baseStyles.messageRow,
-        baseStyles.assistantMessageRow,
+        S().messageRow,
+        S().assistantMessageRow,
       ]}
     >
       <View
         style={[
-          baseStyles.messageBubble,
-          baseStyles.assistantBubble,
-          baseStyles.typingBubble,
+          S().messageBubble,
+          S().assistantBubble,
+          S().typingBubble,
         ]}
       >
-        <View style={baseStyles.typingDots}>
-          <View style={baseStyles.typingDot} />
-          <View style={baseStyles.typingDot} />
-          <View style={baseStyles.typingDot} />
+        <View style={S().typingDots}>
+          <View style={[S().typingDot, { backgroundColor: uiLightMode ? '#7a8aa0' : '#91b5d8' }]} />
+          <View style={[S().typingDot, { backgroundColor: uiLightMode ? '#7a8aa0' : '#91b5d8' }]} />
+          <View style={[S().typingDot, { backgroundColor: uiLightMode ? '#7a8aa0' : '#91b5d8' }]} />
         </View>
       </View>
     </View>
@@ -1317,22 +1585,22 @@ function EmptyState({
   suggestions?: string[];
 }) {
   return (
-    <View style={baseStyles.emptyState}>
-      <View style={baseStyles.logoCircle}>
-        <Text style={baseStyles.logoText}>
+    <View style={S().emptyState}>
+      <View style={S().logoCircle}>
+        <Text style={S().logoText}>
           IK
         </Text>
       </View>
 
-      <Text style={baseStyles.emptyTitle}>
+      <Text style={S().emptyTitle}>
         IK TECH AI
       </Text>
 
-      <Text style={baseStyles.emptySubtitle}>
+      <Text style={S().emptySubtitle}>
         Your AI assistant
       </Text>
 
-      <View style={baseStyles.suggestions}>
+      <View style={S().suggestions}>
         {suggestions.map(
           (suggestion) => (
             <Pressable
@@ -1343,14 +1611,14 @@ function EmptyState({
                 )
               }
               style={({ pressed }) => [
-                baseStyles.suggestionButton,
+                S().suggestionButton,
                 pressed &&
-                  baseStyles.pressed,
+                  S().pressed,
               ]}
             >
               <Text
                 style={
-                  baseStyles.suggestionText
+                  S().suggestionText
                 }
               >
                 {suggestion}
@@ -1382,6 +1650,9 @@ function HomeScreenMain() {
   const [passwordError, setPasswordError] = useState<string | null>(null);
   const [authError, setAuthError] =
     useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
 
 const [profileVisible, setProfileVisible] = useState(false);
 const [profileEditing, setProfileEditing] = useState(false);
@@ -1407,50 +1678,52 @@ const pageBg = isLightTheme ? '#f4f7fb' : '#050b14';
 const panelBg = isLightTheme ? '#ffffff' : '#0a1727';
 const primaryText = isLightTheme ? '#142033' : '#f0f7ff';
 const secondaryText = isLightTheme ? '#526176' : '#91a8c3';
-const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
+uiLightMode = isLightTheme;
+  const tc = (value: string, key = 'color') => (isLightTheme ? toLightColor(key, value, accentColor) : value);
+  const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
 
   // Rebuild shared styles when the user's global appearance/accent preference changes.
   const styles = useMemo(() => {
-    const lightBackgrounds: Record<string, string> = {
-      '#050b14': '#f4f7fb', '#061326': '#f4f7fb', '#07111f': '#eaf0f8',
-      '#0a1727': '#ffffff', '#0b1422': '#ffffff', '#0d1b2d': '#dce7f4',
-      '#101c2d': '#f0f4fa', '#102d4c': '#e3edf8', '#16345a': '#e5efff',
-      '#174a7d': '#e7f0fb', '#205b92': '#dceafe', '#21151a': '#f8e9ec',
+    const accentBackgrounds = ['#1259a5', '#3182ce', '#164a76', '#174c7a', '#1b5791', '#174a7d', '#205b92', '#0b2a4c'];
+    const accentBorders = ['#28547e', '#245b91', '#4d8dce', '#3d7db9'];
+    // Text/icons that sit on top of an accent-coloured button must stay white in both themes.
+    const keepWhiteText = new Set(['authButtonText', 'sendButtonText', 'newChatHistoryText', 'profileActionText', 'historyActionIcon', 'historyActionText', 'bottomNewChatText', 'voiceMicText', 'profileHeaderInitials']);
+    const mapColor = (key: string, value: string, onAccent: boolean): string => {
+      const color = value.toLowerCase();
+      if (color === '@accent') return accentColor;
+      if (color === '@accent15') return `${accentColor}26`;
+      if (color === '@accent30') return `${accentColor}4d`;
+      if (color === '@accent55') return `${accentColor}8c`;
+      if (color === '@onaccent') return '#ffffff';
+      if (!/^#[0-9a-f]{6}$/.test(color)) return value;
+      if (key === 'backgroundColor' && accentBackgrounds.includes(color)) return accentColor;
+      if (key === 'borderColor' && accentBorders.includes(color)) return accentColor;
+      if (!isLightTheme) return value;
+      if (key === 'color' && onAccent) return value;
+      if (key === 'backgroundColor' || key === 'borderColor' || key === 'color') return toLightColor(key, color, accentColor);
+      if (key === 'tintColor') return toLightColor('color', color, accentColor);
+      return value;
     };
-    const lightBorders: Record<string, string> = {
-      '#142337': '#d3deeb', '#19304a': '#d5deea', '#243650': '#d5deea',
-      '#263a54': '#d5deea', '#3d7db9': '#a9c6e8', '#51272e': '#e5c5cb',
-    };
-    const mapStyle = (value: any, key = ''): any => {
-      if (Array.isArray(value)) return value.map((item) => mapStyle(item));
-      if (!value || typeof value !== 'object') {
-        if (typeof value === 'string') {
-          const color = value.toLowerCase();
-          if (color === '@accent') return accentColor;
-          if (color === '@accent15') return `${accentColor}26`;
-          if (color === '@accent30') return `${accentColor}4d`;
-          if (color === '@accent55') return `${accentColor}8c`;
-          if (color === '@onaccent') return '#ffffff';
-          const accentBackgrounds = ['#1259a5', '#3182ce', '#164a76', '#174c7a', '#1b5791', '#174a7d', '#205b92', '#0b2a4c'];
-          if (key === 'backgroundColor' && accentBackgrounds.includes(color)) return accentColor;
-          if (key === 'backgroundColor' && isLightTheme && lightBackgrounds[color]) return lightBackgrounds[color];
-          if (key === 'borderColor' && isLightTheme && lightBorders[color]) return lightBorders[color];
-          if (key === 'borderColor' && ['#28547e', '#245b91', '#4d8dce', '#3d7db9'].includes(color)) return accentColor;
-          if (key === 'color' && isLightTheme) {
-            if (['#ffffff', '#f0f7ff', '#f3f8ff', '#eaf3fd', '#e7f1ff', '#f5f9ff', '#f3f7fd', '#edf5ff', '#dcecff', '#d1e7ff', '#ddecff', '#e6f3ff', '#c5ddf7', '#b9d6f5', '#c1d9f2', '#bcd0e8', '#d8e8fa', '#f0f7ff'].includes(color)) return '#142033';
-            if (['#aab7cc', '#9bbce0', '#91a8c3', '#c0dcf8', '#7187a1', '#8da5bd', '#a8c0d9'].includes(color)) return '#526176';
-            if (['#78b7ff', '#9acaff', '#a9c9ef'].includes(color)) return accentColor;
-          }
-          if (key === 'backgroundColor' && !isLightTheme && ['#1259a5', '#3182ce'].includes(color)) return accentColor;
-        }
-        return value;
+    const mapValue = (value: any, onAccent: boolean, key = ''): any => {
+      if (Array.isArray(value)) return value.map((item) => mapValue(item, onAccent));
+      if (typeof value === 'string') return mapColor(key, value, onAccent);
+      if (value && typeof value === 'object') {
+        const out: Record<string, any> = {};
+        Object.keys(value).forEach((childKey) => { out[childKey] = mapValue(value[childKey], onAccent, childKey); });
+        return out;
       }
-      const result: Record<string, any> = {};
-      Object.keys(value).forEach((childKey) => { result[childKey] = mapStyle(value[childKey], childKey); });
-      return result;
+      return value;
     };
-    return StyleSheet.create(mapStyle(baseStyleDefinitions));
+    const mapped: Record<string, any> = {};
+    Object.keys(baseStyleDefinitions).forEach((name) => {
+      const definition: any = (baseStyleDefinitions as any)[name];
+      const bg = typeof definition?.backgroundColor === 'string' ? definition.backgroundColor.toLowerCase() : '';
+      const onAccent = keepWhiteText.has(name) || bg === '@accent' || accentBackgrounds.includes(bg);
+      mapped[name] = mapValue(definition, onAccent);
+    });
+    return StyleSheet.create(mapped as any) as any;
   }, [isLightTheme, accentColor]);
+  activeStyles = styles;
 
   useEffect(() => {
     let active = true;
@@ -1488,6 +1761,7 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
   const [profileImage, setProfileImage] = useState<string | null>(null);
   const [profileFullName, setProfileFullName] = useState('');
   const [profileDob, setProfileDob] = useState('');
+  const [profileBio, setProfileBio] = useState('');
 
   const [profileLoading, setProfileLoading] = useState(false);
 
@@ -1533,6 +1807,8 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
     const [imageViewerItem, setImageViewerItem] = useState<LibraryItem | null>(null);
     const [imageViewerMenuOpen, setImageViewerMenuOpen] = useState(false);
     const [markupUri, setMarkupUri] = useState<string | null>(null);
+    const [cropUri, setCropUri] = useState<string | null>(null);
+    const [mediaViewer, setMediaViewer] = useState<MediaItem | null>(null);
     const [historySearchOpen, setHistorySearchOpen] = useState(false);
     const [historySearchText, setHistorySearchText] = useState('');
     const menuTouchStartX = useRef<number | null>(null);
@@ -1883,6 +2159,7 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
         if (!user) {
           setProfileFullName('');
           setProfileDob('');
+          setProfileBio('');
           setProfileImage(null);
           return;
         }
@@ -1905,6 +2182,12 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
             setProfileDob(
               typeof data.dob === 'string'
                 ? data.dob
+                : '',
+            );
+
+            setProfileBio(
+              typeof data.bio === 'string'
+                ? data.bio
                 : '',
             );
 
@@ -2102,75 +2385,94 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
     }, [user]);
 
     const handleAuth = useCallback(async () => {
+      if (authBusy) return;
       const email = authEmail.trim();
+      setAuthNotice(null);
 
       if (!email || !authPassword) {
-        setAuthError(
-          'Please enter your email and password.',
-        );
+        setAuthError('Please enter your email and password.');
+        return;
+      }
+      if (!/^\S+@\S+\.\S+$/.test(email)) {
+        setAuthError('Please enter a valid email address.');
+        return;
+      }
+      if (authMode === 'signup' && authPassword.length < 6) {
+        setAuthError('Password should be at least 6 characters.');
         return;
       }
 
       try {
+        setAuthBusy(true);
         setAuthError(null);
 
         if (authMode === 'signup') {
           await createUserWithEmailAndPassword(auth, email, authPassword);
+          setAuthPassword('');
+          Alert.alert('Account created', 'Your account was created successfully. Welcome to IK TECH AI!');
         } else {
-          await signInWithEmailAndPassword(
-            auth,
-            email,
-            authPassword,
-          );
+          await signInWithEmailAndPassword(auth, email, authPassword);
+          setAuthPassword('');
+          showToast('Login successful');
         }
       } catch (error: any) {
-        console.error(
-          '[IK TECH AI] Authentication error:',
-          error,
-        );
-
+        console.error('[IK TECH AI] Authentication error:', error);
         const code = error?.code;
-
         if (code === 'auth/invalid-email') {
-          setAuthError(
-            'Please enter a valid email address.',
-          );
-        } else if (
-          code === 'auth/email-already-in-use'
-        ) {
-          setAuthError(
-            'This email already has an account. Please Login.',
-          );
-        } else if (
-          code === 'auth/weak-password'
-        ) {
-          setAuthError(
-            'Password should be at least 6 characters.',
-          );
-        } else if (
-          code === 'auth/invalid-credential' ||
-          code === 'auth/wrong-password' ||
-          code === 'auth/user-not-found'
-        ) {
-          setAuthError(
-            'Email or password is incorrect.',
-          );
+          setAuthError('Please enter a valid email address.');
+        } else if (code === 'auth/email-already-in-use') {
+          setAuthError('This email already has an account. Please Login.');
+        } else if (code === 'auth/weak-password') {
+          setAuthError('Password should be at least 6 characters.');
+        } else if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') {
+          setAuthError('Email or password is incorrect.');
+        } else if (code === 'auth/too-many-requests') {
+          setAuthError('Too many attempts. Please wait a moment and try again.');
+        } else if (code === 'auth/network-request-failed') {
+          setAuthError('No internet connection. Please check your network and try again.');
+        } else if (code === 'auth/user-disabled') {
+          setAuthError('This account has been disabled.');
         } else {
-          setAuthError(
-            error?.message ||
-              'Authentication failed. Please try again.',
-          );
+          setAuthError(error?.message || 'Authentication failed. Please try again.');
         }
+      } finally {
+        setAuthBusy(false);
       }
-    }, [
-      authEmail,
-      authPassword,
-      authMode,
-    ]);
+    }, [authEmail, authPassword, authMode, authBusy]);
+
+    // Closes every full-screen page (profile, settings, voice, ...) so the Login screen shows straight away after logout.
+    const resetOverlays = () => {
+      setProfileVisible(false);
+      setProfileEditing(false);
+      setSettingsVisible(false);
+      setSettingsOpenSection(null);
+      setSecurityVisible(false);
+      setVoiceVisible(false);
+      setVoicePickerVisible(false);
+      setVoiceOpenSection(null);
+      setNotificationsVisible(false);
+      setStorageVisible(false);
+      setStorageDetail(null);
+      setLibraryVisible(false);
+      setImageVisible(false);
+      setProjectVisible(false);
+      setMemoryVisible(false);
+      setMemorySummaryVisible(false);
+      setSavedMemoriesVisible(false);
+      setPremiumVisible(false);
+      setHistoryVisible(false);
+      setNewPassword('');
+      setConfirmPassword('');
+      setPasswordError(null);
+    };
 
     const handleLogout = useCallback(async () => {
       try {
         await signOut(auth);
+        resetOverlays();
+        setAuthError(null);
+        setAuthNotice(null);
+        showToast('You have been logged out', 'log-out-outline');
       } catch (error) {
         console.error(
           '[IK TECH AI] Logout error:',
@@ -2182,31 +2484,48 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
         );
       }
     }, []);
+
+    useEffect(() => {
+      if (!authLoading && !user) resetOverlays();
+    }, [user, authLoading]);
 const handleForgotPassword = useCallback(async () => {
   const email = authEmail.trim();
+  setAuthNotice(null);
 
   if (!email) {
     setAuthError('Please enter your email address first.');
     return;
   }
+  if (!/^\S+@\S+\.\S+$/.test(email)) {
+    setAuthError('Please enter a valid email address.');
+    return;
+  }
 
   try {
+    setAuthBusy(true);
     setAuthError(null);
 
     await sendPasswordResetEmail(auth, email);
 
+    setAuthNotice('Password reset email sent. Please check your inbox (and spam folder).');
     Alert.alert(
       'Password Reset Email Sent',
       'Please check your email for the password reset link.',
     );
   } catch (error: any) {
     console.error('[IK TECH AI] Forgot password error:', error);
-
+    const code = error?.code;
     setAuthError(
-      error?.code === 'auth/invalid-email'
+      code === 'auth/invalid-email'
         ? 'Please enter a valid email address.'
-        : 'Could not send password reset email. Please try again.',
+        : code === 'auth/network-request-failed'
+          ? 'No internet connection. Please check your network and try again.'
+          : code === 'auth/too-many-requests'
+            ? 'Too many attempts. Please wait a moment and try again.'
+            : 'Could not send password reset email. Please try again.',
     );
+  } finally {
+    setAuthBusy(false);
   }
 }, [authEmail]);
     const handleChangePassword = useCallback(async () => {
@@ -2272,6 +2591,7 @@ const handleForgotPassword = useCallback(async () => {
           {
             fullName: profileFullName.trim(),
             dob: profileDob.trim(),
+            bio: profileBio.trim().slice(0, 300),
             profileImage: profileImage || null,
             email: auth.currentUser.email || '',
             updatedAt: new Date().toISOString(),
@@ -2299,6 +2619,7 @@ const handleForgotPassword = useCallback(async () => {
     }, [
       profileFullName,
       profileDob,
+      profileBio,
       profileImage,
     ]);
 
@@ -2907,6 +3228,7 @@ const handleForgotPassword = useCallback(async () => {
             } else {
               const contextLines: string[] = [];
               if (profileFullName.trim()) contextLines.push(`Saved profile name: ${profileFullName.trim()}.`);
+              if (profileBio.trim()) contextLines.push(`The user's own bio, written by the user in their profile (use it to understand who they are and to personalize answers): ${profileBio.trim().slice(0, 300)}`);
               if (profileDob.trim()) {
                 const birth = new Date(profileDob.trim());
                 if (!Number.isNaN(birth.getTime())) {
@@ -3058,6 +3380,7 @@ const handleForgotPassword = useCallback(async () => {
           memorySummary,
           profileFullName,
           profileDob,
+          profileBio,
           appLanguage,
           appCountry,
           notify,
@@ -3067,7 +3390,6 @@ const handleForgotPassword = useCallback(async () => {
     const handleOpenVoiceMode =
     useCallback(() => {
     if (isStreaming) return;
-
     setErrorMessage(null);
     setVoiceModeVisible(true);
 
@@ -3699,6 +4021,7 @@ const handleForgotPassword = useCallback(async () => {
       if (ClipboardModule?.setStringAsync) await ClipboardModule.setStringAsync(text);
       else await Share.share({ message: text });
       Haptics.selectionAsync().catch(() => {});
+      showToast('Copied to clipboard', 'copy-outline');
     } catch (_error) { /* ignore */ }
   };
 
@@ -3738,6 +4061,11 @@ const handleForgotPassword = useCallback(async () => {
     if (item.kind === 'image' && item.uri) { setImageViewerItem(item); setImageViewerUri(item.uri); return; }
     if (item.kind === 'chat') { setLibraryViewer({ item, text: item.text || '' }); return; }
     if (!item.uri) return;
+    const itemMime = (item.mimeType || '').toLowerCase();
+    if (itemMime.startsWith('video') || itemMime.startsWith('audio') || (itemMime === 'application/pdf' && Platform.OS === 'web')) {
+      setMediaViewer({ uri: item.uri, name: item.name, mimeType: itemMime });
+      return;
+    }
     if (TEXT_FILE_EXTENSIONS.includes(fileExtension(item.name))) {
       try {
         const text = (await (await fetch(item.uri)).text()).slice(0, 200000);
@@ -3764,8 +4092,106 @@ const handleForgotPassword = useCallback(async () => {
     }
   };
 
-  // ── Full-screen image viewer (top bar: close, ⋮, download, Share · bottom tools: Edit, Markup, Resize, Remove) ──
+  // Opens a file that was attached to a chat message (or is waiting in the message box).
+  const openExternalFile = async (uri: string, name: string, mimeType?: string) => {
+    try {
+      if (Platform.OS === 'android' && IntentLauncherModule && FileSystemModule?.getContentUriAsync) {
+        const contentUri = await FileSystemModule.getContentUriAsync(uri);
+        await IntentLauncherModule.startActivityAsync('android.intent.action.VIEW', { data: contentUri, flags: 1, type: mimeType || '*/*' });
+        return;
+      }
+      if (SharingModule && (await SharingModule.isAvailableAsync())) {
+        await SharingModule.shareAsync(uri, { mimeType, dialogTitle: name });
+        return;
+      }
+      if (Platform.OS === 'ios') { await Share.share({ url: uri }); return; }
+      Alert.alert('Cannot open this file type here', 'Install: npx expo install expo-intent-launcher expo-sharing');
+    } catch (_error) {
+      Alert.alert('Could not open file', 'No app on this phone can open this file type, or the file is no longer available.');
+    }
+  };
+
+  const openAttachment = async (attachment: { uri?: string; name: string; mimeType: string; text?: string }) => {
+    if (!attachment) return;
+    const mime = (attachment.mimeType || '').toLowerCase();
+    const name = attachment.name || 'File';
+    if (mime.startsWith('image/') && attachment.uri) { setImageViewerItem(null); setImageViewerUri(attachment.uri); return; }
+    if (mime.startsWith('video') || mime.startsWith('audio') || (mime === 'application/pdf' && Platform.OS === 'web')) {
+      if (!attachment.uri) { Alert.alert('File not available', 'This file is no longer on this phone. Please attach it again.'); return; }
+      setMediaViewer({ uri: attachment.uri, name, mimeType: mime });
+      return;
+    }
+    const pseudoItem: any = { key: `attachment-${name}`, kind: 'file', id: `attachment-${name}`, name, uri: attachment.uri || '', mimeType: mime, createdAt: Date.now() };
+    if (attachment.text) { setLibraryViewer({ item: pseudoItem, text: attachment.text }); return; }
+    if (!attachment.uri) { Alert.alert('File not available', 'This file is no longer on this phone. Please attach it again.'); return; }
+    await openLibraryItem(pseudoItem);
+  };
+
+  // ── Full-screen image viewer (top bar: close, ⋮, download, Share · bottom tools: Edit, Markup, Crop, Remove) ──
   const closeImageViewer = () => { setImageViewerMenuOpen(false); setImageViewerUri(null); setImageViewerItem(null); };
+
+  // Phone back button: go back ONE step (e.g. Settings -> Profile -> Chat) instead of jumping to the chat.
+  const backPressRef = useRef<() => boolean>(() => false);
+  backPressRef.current = () => {
+    if (cropUri) { setCropUri(null); return true; }
+    if (markupUri) { setMarkupUri(null); return true; }
+    if (mediaViewer) { setMediaViewer(null); return true; }
+    if (imageViewerUri) { closeImageViewer(); return true; }
+    if (libraryViewer) { setLibraryViewer(null); return true; }
+    if (voicePickerVisible) { setVoicePickerVisible(false); return true; }
+    if (securityVisible) { setSecurityVisible(false); setSettingsVisible(true); return true; }
+    if (voiceVisible) { Speech.stop().catch(() => {}); setVoiceVisible(false); setVoiceOpenSection(null); setSettingsVisible(true); return true; }
+    if (notificationsVisible) { setNotificationsVisible(false); setSettingsVisible(true); return true; }
+    if (storageVisible) { if (storageDetail) setStorageDetail(null); else { setStorageVisible(false); setSettingsVisible(true); } return true; }
+    if (settingsVisible) { setSettingsVisible(false); setSettingsOpenSection(null); setProfileVisible(true); return true; }
+    if (profileVisible) { setProfileVisible(false); setProfileEditing(false); return true; }
+    if (premiumVisible) { setPremiumVisible(false); return true; }
+    if (savedMemoriesVisible) { setSavedMemoriesVisible(false); return true; }
+    if (memorySummaryVisible) { setMemorySummaryVisible(false); return true; }
+    if (memoryVisible) { setMemoryVisible(false); return true; }
+    if (libraryVisible) { if (libraryOpenFolderId) setLibraryOpenFolderId(null); else setLibraryVisible(false); return true; }
+    if (imageVisible) { setImageVisible(false); return true; }
+    if (projectVisible) { setProjectVisible(false); return true; }
+    if (historyVisible) { setHistoryVisible(false); return true; }
+    return false;
+  };
+  const anyOverlay = !!(cropUri || markupUri || mediaViewer || imageViewerUri || libraryViewer || voicePickerVisible || securityVisible || voiceVisible || notificationsVisible || storageVisible || settingsVisible || profileVisible || premiumVisible || savedMemoriesVisible || memorySummaryVisible || memoryVisible || libraryVisible || imageVisible || projectVisible || historyVisible);
+  const overlayPushedRef = useRef(false);
+
+  useEffect(() => {
+    if (Platform.OS === 'web') return undefined;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => backPressRef.current());
+    return () => subscription.remove();
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    const browser: any = globalThis as any;
+    if (!browser.history) return;
+    if (anyOverlay && !overlayPushedRef.current) {
+      browser.history.pushState({ ikOverlay: true }, '');
+      overlayPushedRef.current = true;
+    } else if (!anyOverlay && overlayPushedRef.current) {
+      overlayPushedRef.current = false;
+      if (browser.history.state?.ikOverlay) browser.history.back();
+    }
+  }, [anyOverlay]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web') return undefined;
+    const browser: any = globalThis as any;
+    const onPopState = () => {
+      if (!overlayPushedRef.current) return;
+      overlayPushedRef.current = false;
+      const handled = backPressRef.current();
+      if (handled) {
+        browser.history.pushState({ ikOverlay: true }, '');
+        overlayPushedRef.current = true;
+      }
+    };
+    browser.addEventListener('popstate', onPopState);
+    return () => browser.removeEventListener('popstate', onPopState);
+  }, []);
   const imageMimeOf = (uri: string) => (uri.startsWith('data:') ? uri.slice(5, uri.indexOf(';')) : 'image/jpeg');
 
   const downloadViewerImage = async () => {
@@ -3851,7 +4277,7 @@ const handleForgotPassword = useCallback(async () => {
 
   const viewerLearnMore = () => {
     setImageViewerMenuOpen(false);
-    afterModalClose(() => Alert.alert('Image tools', 'Edit: send this image to the chat and tell IK TECH AI what to change.\nMarkup: draw on the image.\nResize: save a smaller copy to your Library.\nRemove: delete the image from your Library.\n\n⋮ → Add to Favorites keeps it under Library → Favorites. Open chat attaches it to a new message.'));
+    afterModalClose(() => Alert.alert('Image tools', 'Edit: send this image to the chat and tell IK TECH AI what to change.\nMarkup: draw on the image.\nCrop: cut the picture to the part you want.\nRemove: delete the image from your Library.\n\n⋮ → Add to Favorites keeps it under Library → Favorites. Open chat attaches it to a new message.'));
   };
 
   const markupViewerImage = () => {
@@ -3871,33 +4297,18 @@ const handleForgotPassword = useCallback(async () => {
     notify('library', 'Saved to Library', 'Marked-up image added');
   };
 
-  const resizeViewerImage = () => {
+  const cropViewerImage = () => {
     if (!imageViewerUri) return;
-    if (!ImageManipulatorModule?.manipulateAsync) {
-      Alert.alert('Resize needs a package', 'Run this, then rebuild the app:\nnpx expo install expo-image-manipulator');
-      return;
-    }
-    const sourceUri = imageViewerUri;
-    const baseName = imageViewerItem?.name || 'Image';
-    const folderId = imageViewerItem?.folderId ?? null;
-    const applyScale = (scale: number) => {
-      Image.getSize(sourceUri, async (width) => {
-        try {
-          const result = await ImageManipulatorModule.manipulateAsync(sourceUri, [{ resize: { width: Math.max(64, Math.round(width * scale)) } }], { compress: 0.85, format: 'jpeg', base64: true });
-          const dataUrl = `data:image/jpeg;base64,${result.base64}`;
-          setLibraryImages((current) => [{ id: `img-${Date.now()}`, uri: dataUrl, name: `${baseName} (${Math.round(scale * 100)}%)`, createdAt: Date.now(), folderId }, ...current]);
-          notify('library', 'Saved to Library', `Resized copy (${Math.round(scale * 100)}%) added`);
-          Alert.alert('Resized', 'A smaller copy was saved to your Library.');
-        } catch (_error) {
-          Alert.alert('Could not resize', 'Please try again.');
-        }
-      }, () => Alert.alert('Could not resize', 'This image could not be read.'));
-    };
-    Alert.alert('Resize', 'Save a smaller copy of this image:', [
-      { text: '75%', onPress: () => applyScale(0.75) },
-      { text: '50%', onPress: () => applyScale(0.5) },
-      { text: '25%', onPress: () => applyScale(0.25) },
-    ], { cancelable: true });
+    setCropUri(imageViewerUri);
+  };
+
+  const saveCroppedImage = (dataUrl: string) => {
+    setCropUri(null);
+    setLibraryImages((current) => [{ id: `img-${Date.now()}`, uri: dataUrl, name: `${imageViewerItem?.name || 'Image'} (cropped)`, createdAt: Date.now(), folderId: imageViewerItem?.folderId ?? null }, ...current]);
+    setImageViewerItem(null);
+    setImageViewerUri(dataUrl);
+    showToast('Cropped image saved to Library', 'crop-outline');
+    notify('library', 'Saved to Library', 'Cropped image added');
   };
 
   const removeViewerImage = () => {
@@ -4110,6 +4521,7 @@ const handleForgotPassword = useCallback(async () => {
       if (ClipboardModule?.setStringAsync) await ClipboardModule.setStringAsync(message.content);
       else await Share.share({ message: message.content });
       Haptics.selectionAsync().catch(() => {});
+      showToast('Copied to clipboard', 'copy-outline');
     } catch (_error) { /* ignore */ }
   };
 
@@ -4120,12 +4532,16 @@ const handleForgotPassword = useCallback(async () => {
     setMessageFeedback(next);
     AsyncStorage.setItem('ik-tech-ai:feedback:v1', JSON.stringify(next)).catch(() => {});
     Haptics.selectionAsync().catch(() => {});
+    if (next[message.id] === 'like') showToast('Thank you for feedback', 'thumbs-up');
+    else if (next[message.id] === 'dislike') showToast('Thanks for your feedback. We will do better', 'thumbs-down');
+    else showToast('Feedback removed', 'close-circle');
   };
 
   const handleSpeakMessage = (message: ChatMessage) => {
     Speech.stop().catch(() => {});
-    if (speakingMessageId === message.id) { setSpeakingMessageId(null); return; }
+    if (speakingMessageId === message.id) { setSpeakingMessageId(null); showToast('Stopped reading', 'stop-circle-outline'); return; }
     setSpeakingMessageId(message.id);
+    showToast('Reading aloud…', 'volume-medium-outline');
     Speech.speak(stripMarkdownForSpeech(message.content), {
       ...speakOptions(),
       onDone: () => setSpeakingMessageId(null),
@@ -4337,6 +4753,14 @@ const handleForgotPassword = useCallback(async () => {
                                        </Text>
                                      </View>
 
+                                     <View style={styles.profileInfoBox}>
+                                       <Text style={styles.profileInfoLabel}>Bio</Text>
+
+                                       <Text style={styles.profileInfoValue}>
+                                         {profileBio.trim() || 'Tell IK TECH AI about yourself…'}
+                                       </Text>
+                                     </View>
+
                                      {profileEditing ? (
                                        <>
                                          <TextInput
@@ -4354,6 +4778,19 @@ const handleForgotPassword = useCallback(async () => {
                                            placeholderTextColor="#718096"
                                            style={styles.authInput}
                                          />
+
+                                         <TextInput
+                                           value={profileBio}
+                                           onChangeText={(value) => setProfileBio(value.slice(0, 300))}
+                                           placeholder="Bio (who you are, what you do, what you like…)"
+                                           placeholderTextColor="#718096"
+                                           multiline
+                                           maxLength={300}
+                                           style={[styles.authInput, { minHeight: 92, paddingTop: 14, textAlignVertical: 'top' }]}
+                                         />
+                                         <Text style={{ alignSelf: 'flex-end', color: secondaryText, fontSize: 12, marginTop: -6, marginBottom: 12 }}>
+                                           {profileBio.length}/300 · IK TECH AI uses your bio to know you better
+                                         </Text>
 
                                          <Pressable
                                            onPress={handleSaveProfile}
@@ -4383,13 +4820,13 @@ const handleForgotPassword = useCallback(async () => {
                                        }}
                                        style={styles.profileMenuButton}
                                      >
-                                       <Ionicons name="settings-outline" size={20} color="#f0f7ff" style={styles.profileMenuIcon} />
+                                       <Ionicons name="settings-outline" size={20} color={tc('#f0f7ff')} style={styles.profileMenuIcon} />
 
                                        <Text style={styles.profileMenuText}>
                                          {uiText.settings}
                                        </Text>
 
-                                       <Ionicons name="chevron-forward" size={20} color="#7892ad" />
+                                       <Ionicons name="chevron-forward" size={20} color={tc('#7892ad')} />
                                      </Pressable>
 
                                      <Pressable
@@ -4399,13 +4836,13 @@ const handleForgotPassword = useCallback(async () => {
                                        }}
                                        style={styles.profileMenuButton}
                                      >
-                                       <Ionicons name="lock-closed-outline" size={20} color="#f0f7ff" style={styles.profileMenuIcon} />
+                                       <Ionicons name="lock-closed-outline" size={20} color={tc('#f0f7ff')} style={styles.profileMenuIcon} />
 
                                        <Text style={styles.profileMenuText}>
                                          {uiText.security}
                                        </Text>
 
-                                       <Ionicons name="chevron-forward" size={20} color="#7892ad" />
+                                       <Ionicons name="chevron-forward" size={20} color={tc('#7892ad')} />
                                      </Pressable>
 
                                    </View>
@@ -4729,7 +5166,6 @@ const handleForgotPassword = useCallback(async () => {
               </View>
             ) : null}
 
-            {Platform.OS === 'web' && !isStandalone ? settingsRow('download-outline', 'Install app', valueText(installEvent ? 'Ready' : ''), handleInstallApp, 'forward') : null}
             {settingsRow('notifications-outline', uiText.notifications, valueText(notificationsEnabled && notifPermission === 'granted' ? uiText.on : uiText.off), () => { setSettingsVisible(false); setNotificationsVisible(true); }, 'forward')}
             {settingsRow('server-outline', uiText.storage, valueText(''), () => { setStorageDetail(null); setStorageVisible(true); }, 'forward')}
             {settingsRow('lock-closed-outline', uiText.security, valueText(uiText.changePassword), () => { setSettingsVisible(false); setSecurityVisible(true); }, 'forward')}
@@ -4806,7 +5242,7 @@ const handleForgotPassword = useCallback(async () => {
               }}
               style={styles.profileBackButton}
             >
-              <Ionicons name="arrow-back" size={22} color="#dcecff" />
+              <Ionicons name="arrow-back" size={22} color={tc('#dcecff')} />
             </Pressable>
 
             <Text style={styles.profileTopTitle}>
@@ -4822,21 +5258,35 @@ const handleForgotPassword = useCallback(async () => {
               Password
             </Text>
 
-            <TextInput
-              value={newPassword}
-              onChangeText={setNewPassword}
-              placeholder="New password"
-              placeholderTextColor="#718096"
-              secureTextEntry
-              style={styles.authInput}
-            />
+            <View style={{ position: 'relative', justifyContent: 'center', width: '100%', maxWidth: 430 }}>
+              <TextInput
+                value={newPassword}
+                onChangeText={setNewPassword}
+                placeholder="New password"
+                placeholderTextColor="#718096"
+                secureTextEntry={!showNewPassword}
+                autoCapitalize="none"
+                autoCorrect={false}
+                style={[styles.authInput, { paddingRight: 54, maxWidth: '100%' }]}
+              />
+              <Pressable
+                onPress={() => setShowNewPassword(!showNewPassword)}
+                hitSlop={8}
+                accessibilityLabel={showNewPassword ? 'Hide password' : 'Show password'}
+                style={{ position: 'absolute', right: 6, top: 0, width: 46, height: 52, alignItems: 'center', justifyContent: 'center' }}
+              >
+                <Ionicons name={showNewPassword ? 'eye-off-outline' : 'eye-outline'} size={22} color="#718096" />
+              </Pressable>
+            </View>
 
             <TextInput
               value={confirmPassword}
               onChangeText={setConfirmPassword}
               placeholder="Confirm new password"
               placeholderTextColor="#718096"
-              secureTextEntry
+              secureTextEntry={!showNewPassword}
+              autoCapitalize="none"
+              autoCorrect={false}
               style={styles.authInput}
             />
 
@@ -4884,23 +5334,30 @@ const handleForgotPassword = useCallback(async () => {
               placeholder="Email address"
               placeholderTextColor="#718096"
               autoCapitalize="none"
+              autoCorrect={false}
               keyboardType="email-address"
               style={styles.authInput}
             />
 
 
-<View style={{ position: 'relative', justifyContent: 'center' }}>
+<View style={{ position: 'relative', justifyContent: 'center', width: '100%', maxWidth: 430 }}>
   <TextInput
     value={authPassword}
     onChangeText={setAuthPassword}
     placeholder="Password"
     placeholderTextColor="#718096"
     secureTextEntry={!showPassword}
-    style={[styles.authInput, { paddingRight: 50 }]}
+    autoCapitalize="none"
+    autoCorrect={false}
+    returnKeyType="go"
+    onSubmitEditing={handleAuth}
+    style={[styles.authInput, { paddingRight: 54, maxWidth: '100%' }]}
   />
   <Pressable
     onPress={() => setShowPassword(!showPassword)}
-    style={{ position: 'absolute', right: 15, padding: 8 }}
+    hitSlop={8}
+    accessibilityLabel={showPassword ? 'Hide password' : 'Show password'}
+    style={{ position: 'absolute', right: 6, top: 0, width: 46, height: 52, alignItems: 'center', justifyContent: 'center' }}
   >
     <Ionicons
       name={showPassword ? 'eye-off-outline' : 'eye-outline'}
@@ -4909,6 +5366,13 @@ const handleForgotPassword = useCallback(async () => {
     />
   </Pressable>
 </View>
+
+{authError ? (
+  <Text style={styles.authError}>{authError}</Text>
+) : null}
+{authNotice ? (
+  <Text style={styles.authNotice}>{authNotice}</Text>
+) : null}
 
 {authMode === 'login' && (
   <Pressable
@@ -4923,11 +5387,16 @@ const handleForgotPassword = useCallback(async () => {
 
 <Pressable
   onPress={handleAuth}
-  style={styles.authButton}
+  disabled={authBusy}
+  style={[styles.authButton, authBusy ? { opacity: 0.7 } : null]}
 >
-  <Text style={styles.authButtonText}>
-    {authMode === 'login' ? 'Login' : 'Sign Up'}
-  </Text>
+  {authBusy ? (
+    <ActivityIndicator color="#ffffff" />
+  ) : (
+    <Text style={styles.authButtonText}>
+      {authMode === 'login' ? 'Login' : 'Sign Up'}
+    </Text>
+  )}
 </Pressable>
 
             <Pressable
@@ -4938,6 +5407,7 @@ const handleForgotPassword = useCallback(async () => {
                     : 'login',
                 );
                 setAuthError(null);
+                setAuthNotice(null);
               }}
             >
               <Text style={styles.authSwitchText}>
@@ -4993,7 +5463,7 @@ const handleForgotPassword = useCallback(async () => {
                   pressed && styles.pressed,
                 ]}
               >
-                <Ionicons name="menu" size={24} color="#dcecff" />
+                <Ionicons name="menu" size={24} color={tc('#dcecff')} />
               </Pressable>
 
               <Text style={styles.historyTitle}>
@@ -5049,6 +5519,7 @@ const handleForgotPassword = useCallback(async () => {
                                 onSpeak={handleSpeakMessage}
                                 onShare={handleShareMessage}
                                 onMore={(message) => setMoreMenuMessage(message)}
+                                onOpenAttachment={openAttachment}
                               />
                             )}
                             ListEmptyComponent={
@@ -5089,7 +5560,30 @@ const handleForgotPassword = useCallback(async () => {
                           />
                         </View>
 
-                        {errorMessage ? (
+                        {errorMessage && /limit|quota|too many requests|\b429\b|exceeded|upgrade/i.test(errorMessage) ? (
+                          <View style={{ marginHorizontal: 16, marginBottom: 10, padding: 14, borderRadius: 18, borderWidth: 1, backgroundColor: isLightTheme ? '#fff7e6' : '#2a2112', borderColor: isLightTheme ? '#f0d49a' : '#5c4a1d' }}>
+                            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                              <Ionicons name="alert-circle" size={26} color={isLightTheme ? '#b7791f' : '#f6c453'} style={{ marginRight: 10 }} />
+                              <View style={{ flex: 1, marginRight: 10 }}>
+                                <Text style={{ color: primaryText, fontSize: 15, fontWeight: '800' }}>You reached your limit</Text>
+                                <Text style={{ color: secondaryText, fontSize: 13, lineHeight: 19, marginTop: 3 }}>
+                                  Free messages are used up for now. Upgrade to keep chatting without waiting, or try again when your limit resets.
+                                </Text>
+                              </View>
+                              <Pressable onPress={() => setErrorMessage(null)} hitSlop={10} accessibilityLabel="Close" style={{ alignSelf: 'flex-start' }}>
+                                <Ionicons name="close" size={20} color={secondaryText} />
+                              </Pressable>
+                            </View>
+                            <Pressable
+                              onPress={() => { setErrorMessage(null); setPremiumVisible(true); }}
+                              accessibilityLabel="Upgrade to continue"
+                              style={{ marginTop: 12, minHeight: 46, borderRadius: 14, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', backgroundColor: accentColor }}
+                            >
+                              <Ionicons name="rocket-outline" size={18} color="#ffffff" style={{ marginRight: 8 }} />
+                              <Text style={{ color: '#ffffff', fontSize: 15, fontWeight: '800' }}>Upgrade to continue</Text>
+                            </Pressable>
+                          </View>
+                        ) : errorMessage ? (
                           <View
                             style={styles.errorBox}
                           >
@@ -5119,8 +5613,10 @@ const handleForgotPassword = useCallback(async () => {
 
                         {selectedDocument ? (
                           <View style={[{ flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', maxWidth: '92%', marginHorizontal: 16, marginBottom: 8, paddingVertical: 9, paddingLeft: 12, paddingRight: 6, borderRadius: 14, backgroundColor: isLightTheme ? '#e9edf3' : '#112238' }, isLargeScreen && styles.largeWidthBox]}>
-                            <Ionicons name={selectedDocument.mimeType.startsWith('video') ? 'videocam-outline' : selectedDocument.mimeType.startsWith('audio') ? 'musical-notes-outline' : 'document-text-outline'} size={22} color={accentColor} style={{ marginRight: 10 }} />
-                            <Text style={{ color: primaryText, fontSize: 14, fontWeight: '600', flexShrink: 1 }} numberOfLines={1}>{selectedDocument.name}</Text>
+                            <Pressable onPress={() => openAttachment(selectedDocument)} accessibilityLabel="Open attached file" style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
+                              <Ionicons name={selectedDocument.mimeType.startsWith('video') ? 'videocam-outline' : selectedDocument.mimeType.startsWith('audio') ? 'musical-notes-outline' : 'document-text-outline'} size={22} color={accentColor} style={{ marginRight: 10 }} />
+                              <Text style={{ color: primaryText, fontSize: 14, fontWeight: '600', flexShrink: 1 }} numberOfLines={1}>{selectedDocument.name}</Text>
+                            </Pressable>
                             <Pressable onPress={() => setSelectedDocument(null)} hitSlop={8} style={{ paddingHorizontal: 10, paddingVertical: 4 }} accessibilityLabel="Remove attached file">
                               <Ionicons name="close" size={18} color={secondaryText} />
                             </Pressable>
@@ -5231,7 +5727,7 @@ const handleForgotPassword = useCallback(async () => {
                                 isStreaming && styles.disabled,
                               ]}
                             >
-                              <Ionicons name={isInputVoiceMode ? 'stop' : 'mic-outline'} size={20} color="#e6f3ff" />
+                              <Ionicons name={isInputVoiceMode ? 'stop' : 'mic-outline'} size={20} color={isInputVoiceMode ? '#ffffff' : tc('#e6f3ff')} />
                             </Pressable>
 
                             <Pressable
@@ -5267,25 +5763,25 @@ const handleForgotPassword = useCallback(async () => {
                         >
                           <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.62)', justifyContent: 'flex-end' }}>
                             <Pressable style={StyleSheet.absoluteFill} onPress={() => setImageSourceVisible(false)} accessibilityLabel="Close image source menu" />
-                            <View style={{ backgroundColor: '#071a30', borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 20, paddingTop: 18, paddingBottom: 30, borderWidth: 1, borderColor: '#1e4770' }}>
-                              <View style={{ width: 42, height: 4, borderRadius: 3, backgroundColor: '#52799e', alignSelf: 'center', marginBottom: 16 }} />
-                              <Text style={{ color: '#f0f7ff', fontSize: 18, fontWeight: '800', marginBottom: 14 }}>{uiText.addImage}</Text>
+                            <View style={{ backgroundColor: panelBg, borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 20, paddingTop: 18, paddingBottom: 30, borderWidth: 1, borderColor: hairline }}>
+                              <View style={{ width: 42, height: 4, borderRadius: 3, backgroundColor: isLightTheme ? '#c3cedb' : '#52799e', alignSelf: 'center', marginBottom: 16 }} />
+                              <Text style={{ color: primaryText, fontSize: 18, fontWeight: '800', marginBottom: 14 }}>{uiText.addImage}</Text>
                               {[
                                 { title: uiText.takePhoto, subtitle: uiText.takePhoto, icon: 'camera-outline' as const, action: handleTakePhoto },
                                 { title: uiText.choosePhotos, subtitle: uiText.choosePhotos, icon: 'images-outline' as const, action: handleChooseFromPhotos },
                                 { title: uiText.browseFiles, subtitle: uiText.browseFiles, icon: 'folder-open-outline' as const, action: handleChooseFromFiles },
                               ].map((option) => (
-                                <Pressable key={option.title} onPress={() => { setImageSourceVisible(false); setTimeout(() => { void option.action(); }, 450); }} style={{ minHeight: 62, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 10, borderRadius: 14, backgroundColor: '#0b2948', borderWidth: 1, borderColor: '#1e4770', marginBottom: 9 }}>
+                                <Pressable key={option.title} onPress={() => { setImageSourceVisible(false); setTimeout(() => { void option.action(); }, 450); }} style={{ minHeight: 62, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 10, borderRadius: 14, backgroundColor: isLightTheme ? '#f1f5fa' : '#0b2948', borderWidth: 1, borderColor: hairline, marginBottom: 9 }}>
                                   <Ionicons name={option.icon} size={24} color={accentColor} style={{ marginRight: 13 }} />
                                   <View style={{ flex: 1 }}>
-                                    <Text style={{ color: '#f0f7ff', fontSize: 14, fontWeight: '700' }}>{option.title}</Text>
-                                    <Text style={{ color: '#a8c0d9', fontSize: 12, marginTop: 3 }}>{option.subtitle}</Text>
+                                    <Text style={{ color: primaryText, fontSize: 14, fontWeight: '700' }}>{option.title}</Text>
+                                    <Text style={{ color: secondaryText, fontSize: 12, marginTop: 3 }}>{option.subtitle}</Text>
                                   </View>
-                                  <Ionicons name="chevron-forward" size={18} color="#91b9e2" />
+                                  <Ionicons name="chevron-forward" size={18} color={tc('#91b9e2')} />
                                 </Pressable>
                               ))}
                               <Pressable onPress={() => setImageSourceVisible(false)} style={{ padding: 12, alignItems: 'center' }}>
-                                <Text style={{ color: '#c7d9eb', fontSize: 14, fontWeight: '700' }}>{uiText.cancel}</Text>
+                                <Text style={{ color: primaryText, fontSize: 14, fontWeight: '700' }}>{uiText.cancel}</Text>
                               </Pressable>
                             </View>
                           </View>
@@ -5322,7 +5818,7 @@ const handleForgotPassword = useCallback(async () => {
                             <View style={{ flexDirection: 'row', justifyContent: 'space-around', paddingTop: 14, paddingBottom: Platform.OS === 'web' ? 18 : 30, paddingHorizontal: 10 }}>
                               {viewerTool('chatbox-ellipses-outline', 'Edit', () => openViewerImageInChat('Please edit this image: '))}
                               {viewerTool('brush-outline', 'Markup', markupViewerImage)}
-                              {viewerTool('scan-outline', 'Resize', resizeViewerImage)}
+                              {viewerTool('crop-outline', 'Crop', cropViewerImage)}
                               {viewerTool('trash-outline', 'Remove', removeViewerImage)}
                             </View>
 
@@ -5351,6 +5847,12 @@ const handleForgotPassword = useCallback(async () => {
 
                         <Modal visible={!!markupUri} animationType="slide" statusBarTranslucent onRequestClose={() => setMarkupUri(null)}>
                           {markupUri ? <MarkupEditor uri={markupUri} onCancel={() => setMarkupUri(null)} onDone={saveMarkedImage} /> : null}
+                        </Modal>
+                        <Modal visible={!!cropUri} animationType="slide" statusBarTranslucent onRequestClose={() => setCropUri(null)}>
+                          {cropUri ? <CropEditor uri={cropUri} onCancel={() => setCropUri(null)} onDone={saveCroppedImage} /> : null}
+                        </Modal>
+                        <Modal visible={!!mediaViewer} animationType="slide" statusBarTranslucent onRequestClose={() => setMediaViewer(null)}>
+                          {mediaViewer ? <MediaViewer media={mediaViewer} onClose={() => setMediaViewer(null)} onExternal={() => { const media = mediaViewer; setMediaViewer(null); if (media) setTimeout(() => { void openExternalFile(media.uri, media.name, media.mimeType); }, 350); }} /> : null}
                         </Modal>
 
                         <Modal
@@ -5547,7 +6049,7 @@ const handleForgotPassword = useCallback(async () => {
                             style={styles.historySearchMenuButton}
                             onPress={() => setHistorySearchOpen((open) => !open)}
                           >
-                            <Ionicons name="search" size={19} color="#dcecff" />
+                            <Ionicons name="search" size={19} color={tc('#dcecff')} />
                             <Text style={styles.historyActionText}>{uiText.searchChats}</Text>
                           </Pressable>
                         </View>
@@ -5558,7 +6060,7 @@ const handleForgotPassword = useCallback(async () => {
                               value={historySearchText}
                               onChangeText={setHistorySearchText}
                               placeholder={uiText.searchConversations}
-                              placeholderTextColor="#c1d9f2"
+                              placeholderTextColor={tc('#c1d9f2')}
                               autoFocus
                               style={styles.historySearchInput}
                               returnKeyType="search"
@@ -5584,9 +6086,9 @@ const handleForgotPassword = useCallback(async () => {
                               setImageVisible(true);
                             }}
                           >
-                            <Ionicons name="image-outline" size={20} color="#dcecff" style={styles.historyQuickIcon} />
+                            <Ionicons name="image-outline" size={20} color={tc('#dcecff')} style={styles.historyQuickIcon} />
                             <Text style={styles.historyQuickText}>{uiText.image}</Text>
-                            <Ionicons name="chevron-forward" size={16} color="#ffffff" style={{ marginLeft: 'auto' }} />
+                            <Ionicons name="chevron-forward" size={16} color={tc('#ffffff')} style={{ marginLeft: 'auto' }} />
                           </Pressable>
                           <Pressable
                             style={styles.historyQuickLink}
@@ -5596,9 +6098,9 @@ const handleForgotPassword = useCallback(async () => {
                               setLibraryVisible(true);
                             }}
                           >
-                            <Ionicons name="library-outline" size={20} color="#dcecff" style={styles.historyQuickIcon} />
+                            <Ionicons name="library-outline" size={20} color={tc('#dcecff')} style={styles.historyQuickIcon} />
                             <Text style={styles.historyQuickText}>{uiText.library}</Text>
-                            <Ionicons name="chevron-forward" size={16} color="#ffffff" style={{ marginLeft: 'auto' }} />
+                            <Ionicons name="chevron-forward" size={16} color={tc('#ffffff')} style={{ marginLeft: 'auto' }} />
                           </Pressable>
                           <Pressable
                             style={styles.historyQuickLink}
@@ -5607,9 +6109,9 @@ const handleForgotPassword = useCallback(async () => {
                               setProjectVisible(true);
                             }}
                           >
-                            <Ionicons name="folder-outline" size={20} color="#dcecff" style={styles.historyQuickIcon} />
+                            <Ionicons name="folder-outline" size={20} color={tc('#dcecff')} style={styles.historyQuickIcon} />
                             <Text style={styles.historyQuickText}>{uiText.project}</Text>
-                            <Ionicons name="chevron-forward" size={16} color="#ffffff" style={{ marginLeft: 'auto' }} />
+                            <Ionicons name="chevron-forward" size={16} color={tc('#ffffff')} style={{ marginLeft: 'auto' }} />
                           </Pressable>
                           <Pressable
                             style={styles.historyQuickLink}
@@ -5618,9 +6120,9 @@ const handleForgotPassword = useCallback(async () => {
                               setMemoryVisible(true);
                             }}
                           >
-                            <MaterialCommunityIcons name="brain" size={20} color="#dcecff" style={styles.historyQuickIcon} />
+                            <MaterialCommunityIcons name="brain" size={20} color={tc('#dcecff')} style={styles.historyQuickIcon} />
                             <Text style={styles.historyQuickText}>{uiText.memory}</Text>
-                            <Ionicons name="chevron-forward" size={16} color="#ffffff" style={{ marginLeft: 'auto' }} />
+                            <Ionicons name="chevron-forward" size={16} color={tc('#ffffff')} style={{ marginLeft: 'auto' }} />
                           </Pressable>
                           <Pressable
                             style={styles.historyQuickLink}
@@ -5629,9 +6131,9 @@ const handleForgotPassword = useCallback(async () => {
                               setPremiumVisible(true);
                             }}
                           >
-                            <Ionicons name="diamond-outline" size={20} color="#dcecff" style={styles.historyQuickIcon} />
+                            <Ionicons name="diamond-outline" size={20} color={tc('#dcecff')} style={styles.historyQuickIcon} />
                             <Text style={styles.historyQuickText}>Premium plans</Text>
-                            <Ionicons name="chevron-forward" size={16} color="#ffffff" style={{ marginLeft: 'auto' }} />
+                            <Ionicons name="chevron-forward" size={16} color={tc('#ffffff')} style={{ marginLeft: 'auto' }} />
                           </Pressable>
                         </View>
                     <View style={styles.historyDivider} />
@@ -5655,7 +6157,7 @@ const handleForgotPassword = useCallback(async () => {
                                 styles.noHistory
                               }
                             >
-                              <Ionicons name="chatbubble-outline" size={36} color="#b9d6f5" style={styles.noHistoryIcon} />
+                              <Ionicons name="chatbubble-outline" size={36} color={tc('#b9d6f5')} style={styles.noHistoryIcon} />
 
                               <Text
                                 style={
@@ -5721,7 +6223,7 @@ const handleForgotPassword = useCallback(async () => {
                                   styles.deleteHistoryButton
                                 }
                               >
-                                <Ionicons name="trash-outline" size={18} color="#9bcaff" />
+                                <Ionicons name="trash-outline" size={18} color={tc('#9bcaff')} />
                               </Pressable>
                             </View>
                           )}
@@ -6222,52 +6724,7 @@ const handleForgotPassword = useCallback(async () => {
         <Modal visible={!!moreMenuMessage} transparent animationType="slide" onRequestClose={() => setMoreMenuMessage(null)}>
           <Pressable style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' }} onPress={() => setMoreMenuMessage(null)}>
             <Pressable onPress={() => {}} style={sheetStyle}>
-              {sheetRow('bookmark-outline', 'Save to Favorites', () => { const text = moreMenuMessage?.content || ''; setMoreMenuMessage(null); saveTextToFavorites(text); })}
-              {sheetRow('refresh-outline', uiText.regenerate, () => { if (moreMenuMessage) handleRegenerate(moreMenuMessage); })}
-              <Pressable onPress={() => setMoreMenuMessage(null)} style={{ alignItems: 'center', paddingVertical: 14 }}><Text style={{ color: secondaryText, fontSize: 15, fontWeight: '700' }}>{uiText.cancel}</Text></Pressable>
-            </Pressable>
-          </Pressable>
-        </Modal>
-
-        {/* MEMORY SCREEN */}
-        {memoryVisible && (
-          <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 101, backgroundColor: pageBg, paddingTop: 24 }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, marginBottom: 16 }}>
-              <Pressable onPress={() => setMemoryVisible(false)} style={circleButtonStyle} accessibilityLabel="Back"><Ionicons name="arrow-back" size={22} color={primaryText} /></Pressable>
-              <Text style={{ color: primaryText, fontSize: 18, fontWeight: '700' }}>{uiText.memory}</Text>
-              <Pressable disabled={!memoryDirty} onPress={saveMemoryProfile} accessibilityLabel="Save" style={[circleButtonStyle, { opacity: memoryDirty ? 1 : 0.45, backgroundColor: memoryDirty ? accentColor : panelBg }]}>
-                <Ionicons name="checkmark" size={22} color={memoryDirty ? '#ffffff' : secondaryText} />
-              </Pressable>
-            </View>
-            <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 60 }} keyboardShouldPersistTaps="handled">
-              <View style={{ minHeight: 56, borderRadius: 16, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: rowBg }}>
-                <Text style={{ color: primaryText, fontSize: 16, fontWeight: '600' }}>{uiText.enableMemory}</Text>
-                <Switch value={memoryEnabled} onValueChange={toggleMemoryEnabled} trackColor={{ false: isLightTheme ? '#c9d1dc' : '#2a3c52', true: accentColor }} thumbColor="#ffffff" />
-              </View>
-              <Text style={{ color: secondaryText, fontSize: 14, lineHeight: 21, marginTop: 10, marginBottom: 16, paddingHorizontal: 4 }}>
-                Let IK TECH AI personalize your experience based on your chats, files, and saved details. Memory may include sensitive info you provide.{' '}
-                <Text style={{ color: accentColor }} onPress={() => Alert.alert('About memory', 'When memory is on, IK TECH AI uses your nickname, occupation, notes, saved memories and memory summary to give more relevant answers. You can edit or delete them any time. Turning memory off stops them from being used in chats.')}>Learn more</Text>
-              </Text>
-              <Pressable onPress={() => { setMemorySummaryVisible(true); if (!memorySummary && memoryEnabled) generateMemorySummary(); }} style={{ minHeight: 56, borderRadius: 16, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: rowBg, opacity: memoryEnabled ? 1 : 0.6 }}>
-                <Text style={{ color: primaryText, fontSize: 16, fontWeight: '600' }}>{uiText.memorySummary}</Text>
-                <Ionicons name="chevron-forward" size={20} color={secondaryText} />
-              </Pressable>
-              <Text style={{ color: secondaryText, fontSize: 14, lineHeight: 21, marginTop: 10, marginBottom: 18, paddingHorizontal: 4 }}>
-                View an overview of what IK TECH AI has learned about you. Use{' '}
-                <Text style={{ color: accentColor }} onPress={() => memoryAboutRef.current?.focus()}>custom instructions</Text>
-                {' '}for information you would like it to always keep in mind. You can still manage your old{' '}
-                <Text style={{ color: accentColor }} onPress={() => setSavedMemoriesVisible(true)}>saved memories</Text>.
-              </Text>
-              <Text style={{ color: secondaryText, fontSize: 15, marginBottom: 8, paddingHorizontal: 4 }}>Your nickname</Text>
-              <TextInput value={memoryNickname} onChangeText={setMemoryNickname} editable={memoryEnabled} placeholder="Nickname" placeholderTextColor={secondaryText} style={{ color: primaryText, backgroundColor: rowBg, borderRadius: 16, paddingHorizontal: 15, paddingVertical: 14, fontSize: 16, marginBottom: 18, opacity: memoryEnabled ? 1 : 0.6 }} />
-              <Text style={{ color: secondaryText, fontSize: 15, marginBottom: 8, paddingHorizontal: 4 }}>Your occupation</Text>
-              <TextInput value={memoryOccupation} onChangeText={setMemoryOccupation} editable={memoryEnabled} placeholder="Engineer, student, etc." placeholderTextColor={secondaryText} style={{ color: primaryText, backgroundColor: rowBg, borderRadius: 16, paddingHorizontal: 15, paddingVertical: 14, fontSize: 16, marginBottom: 18, opacity: memoryEnabled ? 1 : 0.6 }} />
-              <Text style={{ color: secondaryText, fontSize: 15, marginBottom: 8, paddingHorizontal: 4 }}>More about you</Text>
-              <TextInput ref={memoryAboutRef} value={memoryAbout} onChangeText={setMemoryAbout} editable={memoryEnabled} multiline placeholder="Interests, values, or preferences to keep in mind" placeholderTextColor={secondaryText} style={{ color: primaryText, backgroundColor: rowBg, borderRadius: 16, paddingHorizontal: 15, paddingVertical: 14, fontSize: 16, minHeight: 130, textAlignVertical: 'top', opacity: memoryEnabled ? 1 : 0.6 }} />
-            </ScrollView>
-          </View>
-        )}
-
+              {sheetRow('bookmark-outline', 'Save to Favorites', () => 
         {memorySummaryVisible && (
           <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 102, backgroundColor: pageBg, paddingTop: 24 }}>
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, marginBottom: 10 }}>
@@ -6597,6 +7054,16 @@ const handleForgotPassword = useCallback(async () => {
         maxWidth: 430,
         marginBottom: 12,
         color: '#ffb9c0',
+        fontSize: 12.5,
+        lineHeight: 18,
+        textAlign: 'center',
+        },
+
+        authNotice: {
+        width: '100%',
+        maxWidth: 430,
+        marginBottom: 12,
+        color: '#7ee2a8',
         fontSize: 12.5,
         lineHeight: 18,
         textAlign: 'center',
@@ -7910,6 +8377,7 @@ const handleForgotPassword = useCallback(async () => {
         <HomeScreenMain />
         <AppDialogHost />
         <NoticeBannerHost />
+        <ToastHost />
         </>
         );
         }
