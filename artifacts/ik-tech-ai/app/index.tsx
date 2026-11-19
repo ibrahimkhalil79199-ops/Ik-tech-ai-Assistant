@@ -61,6 +61,9 @@ import {
   signInWithEmailAndPassword,
   updatePassword,
   sendPasswordResetEmail,
+  onAuthStateChanged,
+  signOut,
+  type User,
 } from 'firebase/auth';
 
 import firebaseApp, { auth, db } from '@/firebase';
@@ -5819,7 +5822,7 @@ const handleForgotPassword = useCallback(async () => {
                             <Pressable
                               key={item.title}
                               onPress={() => { setImageVisible(false); setDraft(item.prompt); requestAnimationFrame(() => inputRef.current?.focus()); }}
-                             style={{ width: '48%', marginBottom: 12, borderRadius: 18, overflow: 'hidden', padding: 14, minHeight: 118, backgroundColor: item.color, justifyContent: 'space-between' }} 
+                             style={{ width: '48%', marginBottom: 12, borderRadius: 18, overflow: 'hidden', padding: 14, minHeight: 118,justifyContent: 'space-between' }} 
                             >
                              <Image
   source={{ uri: item.image }}
@@ -5856,7 +5859,7 @@ const handleForgotPassword = useCallback(async () => {
                             <Pressable
                               key={item.title}
                               onPress={() => { setImageVisible(false); setDraft(item.prompt); setTimeout(() => setImageSourceVisible(true), 350); }}
-                              style={{ width: '48%', marginBottom: 12, borderRadius: 18, overflow: 'hidden', padding: 14, minHeight: 104, backgroundColor: item.color, justifyContent: 'space-between' }}
+                              style={{ width: '48%', marginBottom: 12, borderRadius: 18, overflow: 'hidden', padding: 14, minHeight: 104, justifyContent: 'space-between' }}
                             >
                               <Image
   source={{ uri: item.image }}
