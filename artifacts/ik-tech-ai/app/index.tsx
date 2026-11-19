@@ -37,6 +37,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Speech from 'expo-speech';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { useFonts } from 'expo-font';
 
 import {
   ExpoSpeechRecognitionModule,
@@ -57,11 +58,9 @@ import {
 
 import {
   createUserWithEmailAndPassword,
-  onAuthStateChanged,
   signInWithEmailAndPassword,
-  signOut,
   updatePassword,
-  User,
+  sendPasswordResetEmail,
 } from 'firebase/auth';
 
 import firebaseApp, { auth, db } from '@/firebase';
@@ -231,22 +230,73 @@ const requestGeneratedImage = async (prompt: string, sourceDataUrl: string | nul
   return returned.startsWith('data:image/') ? returned : `data:${payload.mimeType || 'image/png'};base64,${returned}`;
 };
 
+
 const IMAGE_SAMPLES_CREATE = [
-  { emoji: '🐒', title: 'Animals', prompt: 'Create a monkey sitting on a tree in the jungle', color: '#2e7d32' },
-  { emoji: '🏙️', title: 'Cities', prompt: 'Create a futuristic city at night with neon lights', color: '#5b3ea8' },
-  { emoji: '🎨', title: 'Logos', prompt: 'Create a modern logo for a tech company called IK TECH', color: '#1565c0' },
-  { emoji: '👤', title: 'Portraits', prompt: 'Create a portrait of a smiling man in traditional Nigerian attire', color: '#8d4b1f' },
-  { emoji: '🍲', title: 'Food', prompt: 'Create a delicious plate of jollof rice with grilled chicken', color: '#c2410c' },
-  { emoji: '🏞️', title: 'Landscapes', prompt: 'Create a beautiful sunrise over green mountains and a lake', color: '#0f766e' },
-  { emoji: '🎉', title: 'Posters', prompt: 'Create a colorful birthday party poster', color: '#be185d' },
-  { emoji: '😺', title: 'Cartoons', prompt: 'Create a cute cartoon cat wearing sunglasses', color: '#a16207' },
+  {
+    title: 'Photorealistic Animals',
+    image: 'https://images.unsplash.com/photo-1546182990-dffeafbe841d?w=700',
+    prompt: 'Create an ultra-realistic, professional wildlife photograph of a beautiful wild animal in its natural habitat. Use natural lighting, realistic textures, sharp details, cinematic composition and professional photography quality.'
+  },
+  {
+    title: 'Modern Architecture',
+    image: 'https://images.unsplash.com/photo-1511818966892-d7d671e672a2?w=700',
+    prompt: 'Create a breathtaking futuristic city with elegant modern skyscrapers, beautiful architecture, realistic reflections, cinematic lighting and extraordinary detail. Make it look like a premium architectural photograph.'
+  },
+  {
+    title: 'Professional Logos',
+    image: 'https://images.unsplash.com/photo-1626785774573-4b799315345d?w=700',
+    prompt: 'Design a premium, modern and professional technology brand logo for IK TECH. Create a unique visual identity, clean typography, balanced proportions, elegant colors and a memorable professional appearance.'
+  },
+  {
+    title: 'Portrait Photography',
+    image: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=700',
+    prompt: 'Create a highly realistic professional portrait photograph of a confident African man wearing elegant traditional Nigerian attire. Preserve natural facial proportions, realistic skin texture, beautiful lighting and a premium photography style.'
+  },
+  {
+    title: 'Food Photography',
+    image: 'https://images.unsplash.com/photo-1512621776951-a57141f2eefd?w=700',
+    prompt: 'Create a mouthwatering, photorealistic food photograph of Nigerian jollof rice served with grilled chicken. Include realistic food textures, beautiful presentation, natural colors, soft studio lighting and professional restaurant photography.'
+  },
+  {
+    title: 'Nature & Landscapes',
+    image: 'https://images.unsplash.com/photo-1470770841072-f978cf4d019e?w=700',
+    prompt: 'Create a breathtaking photorealistic landscape featuring beautiful green mountains, a peaceful lake and warm golden sunrise light. Use cinematic composition, atmospheric depth and extraordinary natural detail.'
+  },
+  {
+    title: 'Creative Posters',
+    image: 'https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=700',
+    prompt: 'Design a stunning professional event poster with beautiful typography, creative layout, attractive colors, balanced spacing and premium graphic design quality. Make all requested text clear and readable.'
+  },
+  {
+    title: 'Digital Illustrations',
+    image: 'https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=700',
+    prompt: 'Create an original high-quality digital illustration with beautiful artistic details, harmonious colors, clean composition, professional rendering and a visually captivating style.'
+  },
 ];
+
 const IMAGE_SAMPLES_EDIT = [
-  { emoji: '🌅', title: 'Change background', prompt: 'Change the background of this photo to a beautiful beach', color: '#0369a1' },
-  { emoji: '☀️', title: 'Brighten photo', prompt: 'Brighten this photo and make the colors more vivid', color: '#b45309' },
-  { emoji: '🎭', title: 'Cartoon style', prompt: 'Turn this photo into a cartoon', color: '#7e22ce' },
-  { emoji: '🧹', title: 'Remove object', prompt: 'Remove the object in the background of this photo', color: '#475569' },
+  {
+    title: 'Change Background',
+    image: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=700',
+    prompt: 'Edit the uploaded photo by replacing only its background with a beautiful realistic tropical beach. Preserve the original person, face, identity, clothing, body proportions and pose exactly. Blend the subject naturally into the new environment.'
+  },
+  {
+    title: 'Professional Enhancement',
+    image: 'https://images.unsplash.com/photo-1470252649378-9c29740c9fa8?w=700',
+    prompt: 'Professionally enhance this photograph. Improve exposure, lighting, sharpness, color balance and overall image clarity. Preserve the original person, face, identity, clothing and all important details without changing their appearance.'
+  },
+  {
+    title: 'Artistic Style',
+    image: 'https://images.unsplash.com/photo-1547891654-e66ed7ebb968?w=700',
+    prompt: 'Transform the uploaded photograph into a beautiful high-quality artistic illustration. Preserve the subject identity, facial features, pose and important details while applying a polished artistic style.'
+  },
+  {
+    title: 'Remove Unwanted Objects',
+    image: 'https://images.unsplash.com/photo-1472214103451-9374bd1c798e?w=700',
+    prompt: 'Carefully remove the unwanted object specified by the user from the uploaded photograph. Reconstruct the background naturally and seamlessly. Preserve the original subject, face, identity and image quality.'
+  },
 ];
+
 
 const VOICE_GROUP_NAMES: Record<string, string> = {
   'en-GB': 'British English', 'en-US': 'American English', 'en-NG': 'Nigerian English', 'en-AU': 'Australian English', 'en-IN': 'Indian English', 'en-ZA': 'South African English',
@@ -1311,6 +1361,10 @@ function EmptyState({
 }
 
 function HomeScreenMain() {
+    const [iconFontsLoaded] = useFonts({
+    ...Ionicons.font,
+    ...MaterialCommunityIcons.font,
+  });
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
@@ -2124,6 +2178,33 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
         );
       }
     }, []);
+const handleForgotPassword = useCallback(async () => {
+  const email = authEmail.trim();
+
+  if (!email) {
+    setAuthError('Please enter your email address first.');
+    return;
+  }
+
+  try {
+    setAuthError(null);
+
+    await sendPasswordResetEmail(auth, email);
+
+    Alert.alert(
+      'Password Reset Email Sent',
+      'Please check your email for the password reset link.',
+    );
+  } catch (error: any) {
+    console.error('[IK TECH AI] Forgot password error:', error);
+
+    setAuthError(
+      error?.code === 'auth/invalid-email'
+        ? 'Please enter a valid email address.'
+        : 'Could not send password reset email. Please try again.',
+    );
+  }
+}, [authEmail]);
     const handleChangePassword = useCallback(async () => {
       if (!newPassword || !confirmPassword) {
         setPasswordError('Please enter the new password and confirm it.');
@@ -4815,6 +4896,16 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
               onPress={handleAuth}
               style={styles.authButton}
             >
+                          {authMode === 'login' && (
+              <Pressable
+                onPress={handleForgotPassword}
+                style={{ alignSelf: 'flex-end', marginBottom: 14 }}
+              >
+                <Text style={{ color: '#60A5FA', fontSize: 13, fontWeight: '700' }}>
+                  Forgot password?
+                </Text>
+              </Pressable>
+            )}
               <Text style={styles.authButtonText}>
                 {authMode === 'login'
                   ? 'Login'
@@ -5728,9 +5819,29 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
                             <Pressable
                               key={item.title}
                               onPress={() => { setImageVisible(false); setDraft(item.prompt); requestAnimationFrame(() => inputRef.current?.focus()); }}
-                              style={{ width: '48%', marginBottom: 12, borderRadius: 18, padding: 14, minHeight: 118, backgroundColor: item.color, justifyContent: 'space-between' }}
+                             style={{ width: '48%', marginBottom: 12, borderRadius: 18, overflow: 'hidden', padding: 14, minHeight: 118, backgroundColor: item.color, justifyContent: 'space-between' }} 
                             >
-                              <Text style={{ fontSize: 32 }}>{item.emoji}</Text>
+                             <Image
+  source={{ uri: item.image }}
+  style={{
+    position: 'absolute',
+    width: '100%',
+    height: '100%',
+    borderRadius: 18,
+  }}
+  resizeMode="cover"
+/>
+<View
+  style={{
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.42)',
+    borderRadius: 18,
+  }}
+/> 
                               <View>
                                 <Text style={{ color: '#ffffff', fontSize: 16, fontWeight: '800' }}>{item.title}</Text>
                                 <Text style={{ color: 'rgba(255,255,255,0.85)', fontSize: 12, marginTop: 3 }} numberOfLines={2}>{item.prompt}</Text>
@@ -5745,9 +5856,29 @@ const uiText = useMemo(() => buildUiText(appLanguage), [appLanguage]);
                             <Pressable
                               key={item.title}
                               onPress={() => { setImageVisible(false); setDraft(item.prompt); setTimeout(() => setImageSourceVisible(true), 350); }}
-                              style={{ width: '48%', marginBottom: 12, borderRadius: 18, padding: 14, minHeight: 104, backgroundColor: item.color, justifyContent: 'space-between' }}
+                              style={{ width: '48%', marginBottom: 12, borderRadius: 18, overflow: 'hidden', padding: 14, minHeight: 104, backgroundColor: item.color, justifyContent: 'space-between' }}
                             >
-                              <Text style={{ fontSize: 30 }}>{item.emoji}</Text>
+                              <Image
+  source={{ uri: item.image }}
+  style={{
+    position: 'absolute',
+    width: '100%',
+    height: '100%',
+    borderRadius: 18,
+  }}
+  resizeMode="cover"
+/>
+<View
+  style={{
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.42)',
+    borderRadius: 18,
+  }}
+/>
                               <View>
                                 <Text style={{ color: '#ffffff', fontSize: 16, fontWeight: '800' }}>{item.title}</Text>
                                 <Text style={{ color: 'rgba(255,255,255,0.85)', fontSize: 12, marginTop: 3 }}>Choose a photo, then send</Text>
