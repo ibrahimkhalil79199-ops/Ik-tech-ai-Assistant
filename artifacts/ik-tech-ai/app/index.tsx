@@ -6724,7 +6724,52 @@ const handleForgotPassword = useCallback(async () => {
         <Modal visible={!!moreMenuMessage} transparent animationType="slide" onRequestClose={() => setMoreMenuMessage(null)}>
           <Pressable style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' }} onPress={() => setMoreMenuMessage(null)}>
             <Pressable onPress={() => {}} style={sheetStyle}>
-              {sheetRow('bookmark-outline', 'Save to Favorites', () => 
+              {sheetRow('bookmark-outline', 'Save to Favorites', () => { const text = moreMenuMessage?.content || ''; setMoreMenuMessage(null); saveTextToFavorites(text); })}
+              {sheetRow('refresh-outline', uiText.regenerate, () => { if (moreMenuMessage) handleRegenerate(moreMenuMessage); })}
+              <Pressable onPress={() => setMoreMenuMessage(null)} style={{ alignItems: 'center', paddingVertical: 14 }}><Text style={{ color: secondaryText, fontSize: 15, fontWeight: '700' }}>{uiText.cancel}</Text></Pressable>
+            </Pressable>
+          </Pressable>
+        </Modal>
+
+        {/* MEMORY SCREEN */}
+        {memoryVisible && (
+          <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 101, backgroundColor: pageBg, paddingTop: 24 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, marginBottom: 16 }}>
+              <Pressable onPress={() => setMemoryVisible(false)} style={circleButtonStyle} accessibilityLabel="Back"><Ionicons name="arrow-back" size={22} color={primaryText} /></Pressable>
+              <Text style={{ color: primaryText, fontSize: 18, fontWeight: '700' }}>{uiText.memory}</Text>
+              <Pressable disabled={!memoryDirty} onPress={saveMemoryProfile} accessibilityLabel="Save" style={[circleButtonStyle, { opacity: memoryDirty ? 1 : 0.45, backgroundColor: memoryDirty ? accentColor : panelBg }]}>
+                <Ionicons name="checkmark" size={22} color={memoryDirty ? '#ffffff' : secondaryText} />
+              </Pressable>
+            </View>
+            <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingBottom: 60 }} keyboardShouldPersistTaps="handled">
+              <View style={{ minHeight: 56, borderRadius: 16, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: rowBg }}>
+                <Text style={{ color: primaryText, fontSize: 16, fontWeight: '600' }}>{uiText.enableMemory}</Text>
+                <Switch value={memoryEnabled} onValueChange={toggleMemoryEnabled} trackColor={{ false: isLightTheme ? '#c9d1dc' : '#2a3c52', true: accentColor }} thumbColor="#ffffff" />
+              </View>
+              <Text style={{ color: secondaryText, fontSize: 14, lineHeight: 21, marginTop: 10, marginBottom: 16, paddingHorizontal: 4 }}>
+                Let IK TECH AI personalize your experience based on your chats, files, and saved details. Memory may include sensitive info you provide.{' '}
+                <Text style={{ color: accentColor }} onPress={() => Alert.alert('About memory', 'When memory is on, IK TECH AI uses your nickname, occupation, notes, saved memories and memory summary to give more relevant answers. You can edit or delete them any time. Turning memory off stops them from being used in chats.')}>Learn more</Text>
+              </Text>
+              <Pressable onPress={() => { setMemorySummaryVisible(true); if (!memorySummary && memoryEnabled) generateMemorySummary(); }} style={{ minHeight: 56, borderRadius: 16, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: rowBg, opacity: memoryEnabled ? 1 : 0.6 }}>
+                <Text style={{ color: primaryText, fontSize: 16, fontWeight: '600' }}>{uiText.memorySummary}</Text>
+                <Ionicons name="chevron-forward" size={20} color={secondaryText} />
+              </Pressable>
+              <Text style={{ color: secondaryText, fontSize: 14, lineHeight: 21, marginTop: 10, marginBottom: 18, paddingHorizontal: 4 }}>
+                View an overview of what IK TECH AI has learned about you. Use{' '}
+                <Text style={{ color: accentColor }} onPress={() => memoryAboutRef.current?.focus()}>custom instructions</Text>
+                {' '}for information you would like it to always keep in mind. You can still manage your old{' '}
+                <Text style={{ color: accentColor }} onPress={() => setSavedMemoriesVisible(true)}>saved memories</Text>.
+              </Text>
+              <Text style={{ color: secondaryText, fontSize: 15, marginBottom: 8, paddingHorizontal: 4 }}>Your nickname</Text>
+              <TextInput value={memoryNickname} onChangeText={setMemoryNickname} editable={memoryEnabled} placeholder="Nickname" placeholderTextColor={secondaryText} style={{ color: primaryText, backgroundColor: rowBg, borderRadius: 16, paddingHorizontal: 15, paddingVertical: 14, fontSize: 16, marginBottom: 18, opacity: memoryEnabled ? 1 : 0.6 }} />
+              <Text style={{ color: secondaryText, fontSize: 15, marginBottom: 8, paddingHorizontal: 4 }}>Your occupation</Text>
+              <TextInput value={memoryOccupation} onChangeText={setMemoryOccupation} editable={memoryEnabled} placeholder="Engineer, student, etc." placeholderTextColor={secondaryText} style={{ color: primaryText, backgroundColor: rowBg, borderRadius: 16, paddingHorizontal: 15, paddingVertical: 14, fontSize: 16, marginBottom: 18, opacity: memoryEnabled ? 1 : 0.6 }} />
+              <Text style={{ color: secondaryText, fontSize: 15, marginBottom: 8, paddingHorizontal: 4 }}>More about you</Text>
+              <TextInput ref={memoryAboutRef} value={memoryAbout} onChangeText={setMemoryAbout} editable={memoryEnabled} multiline placeholder="Interests, values, or preferences to keep in mind" placeholderTextColor={secondaryText} style={{ color: primaryText, backgroundColor: rowBg, borderRadius: 16, paddingHorizontal: 15, paddingVertical: 14, fontSize: 16, minHeight: 130, textAlignVertical: 'top', opacity: memoryEnabled ? 1 : 0.6 }} />
+            </ScrollView>
+          </View>
+        )}
+
         {memorySummaryVisible && (
           <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 102, backgroundColor: pageBg, paddingTop: 24 }}>
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, marginBottom: 10 }}>
