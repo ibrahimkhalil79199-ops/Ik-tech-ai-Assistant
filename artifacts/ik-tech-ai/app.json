@@ -28,6 +28,7 @@
       "favicon": "./assets/images/icon.png"
     },
     "plugins": [
+      "expo-location",
       "expo-router",
       "expo-sharing"
     ],
