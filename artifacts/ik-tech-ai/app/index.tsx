@@ -60,6 +60,10 @@ import {
 import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
+  GoogleAuthProvider,
+  OAuthProvider,
+  signInWithCredential,
+  signInWithPopup,
   updatePassword,
   sendPasswordResetEmail,
   onAuthStateChanged,
@@ -85,6 +89,12 @@ type SelectedImage = {
   uri: string;
   mimeType?: string;
 };
+
+// A file waiting to be sent. `fullText` keeps the whole text of a text/code file (only used for splitting it into parts).
+type AttachedDoc = { uri: string; name: string; mimeType: string; text?: string; fullText?: string };
+// One part produced when the user asks the app to split a file.
+type SplitFile = { name: string; mimeType: string; size: number; text?: string; uri?: string };
+const MAX_ATTACHMENTS = 10;
 
 // ───────────────── Optional native modules (the app still runs if they are not installed) ─────────────────
 let ClipboardModule: any = null;
@@ -423,6 +433,28 @@ let ViewShotModule: any = null;
 try { ViewShotModule = require('react-native-view-shot'); } catch (_error) { ViewShotModule = null; }
 let NotificationsModule: any = null;
 try { NotificationsModule = require('expo-notifications'); } catch (_error) { NotificationsModule = null; }
+let LocationModule: any = null;
+try { LocationModule = require('expo-location'); } catch (_error) { LocationModule = null; }
+
+// ───────────────── Location + past-chat awareness (context sent to the AI) ─────────────────
+type PlaceInfo = { city: string; state: string; country: string; district: string; street: string; latitude: number; longitude: number; updatedAt: number };
+const LOCATION_QUESTION = /(where am i|which (town|city|state|country)|what (town|city|state|country)|my location|near me|a wani (gari|gida|jiha|ƙasa|kasa|yanki)|wane (gari|jiha|yanki)|a ina (nake|muke)|ina nake|inda nake|wurin da nake|location (na|din|ɗina))/i;
+const PAST_CHAT_QUESTION = /(previous|earlier|last|past|before|yesterday|remember|recall|we (talked|discussed|spoke)|you told me|i (told|asked) you|hirar(mu|ar)? (da|ta) (jiya|baya|farko)|(jiya|a baya|da farko|can baya|ɗazu|dazu)|mun yi hira|na gaya maka|na tambaye ka|ka tuna|tunawa|tuna)/i;
+const placeFromGeocode = (geo: any, latitude: number, longitude: number): PlaceInfo => ({
+  city: String(geo?.city || geo?.subregion || geo?.district || '').trim(),
+  state: String(geo?.region || '').trim(),
+  country: String(geo?.country || '').trim(),
+  district: String(geo?.district || geo?.subregion || '').trim(),
+  street: String(geo?.street || geo?.name || '').trim(),
+  latitude,
+  longitude,
+  updatedAt: Date.now(),
+});
+const placeToLine = (place: PlaceInfo) => {
+  const parts = [place.street, place.district && place.district !== place.city ? place.district : '', place.city, place.state, place.country].filter(Boolean);
+  const unique = parts.filter((part, index) => parts.indexOf(part) === index);
+  return `${unique.join(', ')} (lat ${place.latitude.toFixed(4)}, lon ${place.longitude.toFixed(4)})`;
+};
 
 // ───────────────── Theme helpers (light / dark), press feedback, toast ─────────────────
 let uiLightMode = false;
@@ -932,6 +964,79 @@ function removePersistedFile(uri?: string) {
   FS.deleteAsync(uri, { idempotent: true }).catch(() => {});
 }
 
+// ───────────────── Splitting a file into parts (done on the phone, so nothing is lost) ─────────────────
+const SPLIT_NUMBER_WORDS: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, biyu: 2, uku: 3, hudu: 4, biyar: 5, shida: 6, bakwai: 7, takwas: 8, tara: 9, goma: 10 };
+
+function detectSplitRequest(text: string): { parts: number; as: 'files' | 'document' } | null {
+  const value = (text || '').toLowerCase();
+  if (!value.trim()) return null;
+  if (!/\b(split|divide|raba\w*|yanka\w*|yanki)\b/.test(value)) return null;
+  const words = Object.keys(SPLIT_NUMBER_WORDS).join('|');
+  const notThings = '(?!\\s*(?:steps?|ways?|points?|sentences?|paragraphs?|categories|tips?))';
+  const match =
+    value.match(new RegExp(`(?:into|to|zuwa|gida|sassa|parts?|pieces?)\\s*(\\d{1,2}|${words})\\b${notThings}`)) ||
+    value.match(new RegExp(`\\b(\\d{1,2}|${words})\\s*(?:parts?|pieces?|gida|sassa|files?|fayil\\w*|documents?|docs?)\\b`));
+  if (!match) return null;
+  const raw = match[1];
+  const parts = /^\d+$/.test(raw) ? parseInt(raw, 10) : SPLIT_NUMBER_WORDS[raw];
+  if (!parts || parts < 2) return null;
+  // The word the user mentions LAST decides the output ("split this file into 6 documents" -> documents).
+  const lastIndex = (pattern: RegExp) => { let last = -1; let found: RegExpExecArray | null; const re = new RegExp(pattern.source, 'g'); while ((found = re.exec(value))) last = found.index; return last; };
+  const fileAt = lastIndex(/\b(files?|fayil\w*)\b/);
+  const docAt = lastIndex(/\b(documents?|docs?|decuments?|decumments?|dokument\w*|takarda|takardu)\b/);
+  return { parts: Math.min(parts, 50), as: docAt > fileAt ? 'document' : 'files' };
+}
+
+function splitTextIntoParts(content: string, parts: number): string[] {
+  const lines = content.match(/[^\n]*\n|[^\n]+$/g) || [];
+  if (lines.length < parts) {
+    // Very few lines (for example one long line): cut by characters instead.
+    const size = Math.max(1, Math.ceil(content.length / parts));
+    const out: string[] = [];
+    for (let i = 0; i < content.length; i += size) out.push(content.slice(i, i + size));
+    return out.length ? out : [content];
+  }
+  const base = Math.floor(lines.length / parts);
+  const extra = lines.length % parts;
+  const out: string[] = [];
+  let cursor = 0;
+  for (let i = 0; i < parts; i += 1) {
+    const take = base + (i < extra ? 1 : 0);
+    out.push(lines.slice(cursor, cursor + take).join(''));
+    cursor += take;
+  }
+  return out;
+}
+
+async function buildSplitFiles(originalName: string, pieces: string[], as: 'files' | 'document'): Promise<SplitFile[]> {
+  const clean = safeFileName(originalName);
+  const dot = clean.lastIndexOf('.');
+  const base = dot > 0 ? clean.slice(0, dot) : clean;
+  const originalExt = dot > 0 ? clean.slice(dot + 1).toLowerCase() : 'txt';
+  const ext = as === 'document' ? 'txt' : originalExt;
+  const mimeType = as === 'document' ? 'text/plain' : (EXTENSION_MIME[ext] || 'text/plain');
+  const FS = FileSystemModule;
+  const stamp = Date.now();
+  const result: SplitFile[] = [];
+  for (let i = 0; i < pieces.length; i += 1) {
+    const name = `${base}_part_${i + 1}.${ext}`;
+    const text = pieces[i];
+    const size = text.length;
+    if (Platform.OS !== 'web' && FS?.documentDirectory) {
+      try {
+        const dir = `${FS.documentDirectory}ik-split/`;
+        await FS.makeDirectoryAsync(dir, { intermediates: true }).catch(() => {});
+        const uri = `${dir}${stamp}-${name}`;
+        await FS.writeAsStringAsync(uri, text, { encoding: 'utf8' });
+        result.push({ name, mimeType, size, uri });
+        continue;
+      } catch (_error) { /* fall back to keeping the text in memory */ }
+    }
+    result.push({ name, mimeType, size, text });
+  }
+  return result;
+}
+
 // Storage allowance shown in Settings → Storage (change this number to suit your app).
 const STORAGE_LIMIT_MB = 500;
 
@@ -1048,7 +1153,6 @@ const UI_TRANSLATIONS: Record<string, Partial<UiStrings>> = {
 const buildUiText = (language: string): UiStrings => ({ ...UI_EN, ...(UI_TRANSLATIONS[language] || {}) } as UiStrings);
 
 const stripMarkdownForSpeech = (text: string) => text.replace(/```[\s\S]*?```/g, ' ').replace(/[`*_#>~]/g, '');
-
 function getNigeriaDateTimeAnswer(question: string): string | null {
   const q = question.toLowerCase().replace(/[’']/g, "'").replace(/[?!.,]/g, ' ').replace(/\s+/g, ' ').trim();
   if (/\b(islamic|islam|hijri|hijra|musulinci|musulunci|musulmi|ramadan)\b/.test(q)) return null;
@@ -1343,6 +1447,8 @@ const ATTACHMENT_TYPES: Record<string, string> = {
   mp3: 'audio/mp3', m4a: 'audio/aac', wav: 'audio/wav', ogg: 'audio/ogg', flac: 'audio/flac', aac: 'audio/aac',
 };
 
+const PLACE_KNOWLEDGE_HINT = 'When the user asks about any town, city, state, or country (for example "Ina Kano take?" or "Where is Zaria?"), say clearly which state/region and country it is in, and add a short useful fact (nearby places, what it is known for). Use the place name the user wrote; if several places share that name, mention the most well-known one first and ask which one they mean.';
+const LOCATION_ANSWER_HINT = 'The user has allowed the app to use their phone location. When they ask where they are (for example "a wani gari nake?" or "which town am I in?"), answer from the CURRENT DEVICE LOCATION given in this private context: say the town/city, state, and country. Never invent a location, and say it is approximate. If no device location is given, tell them to turn on "Location" in Settings.';
 const COPY_INTENT = /\b(copy|copying|kwafa|kwafi|kwafe|kwafin)\b/i;
 const COPY_STYLE_HINT = 'The user wants to COPY part of your answer. Write one short normal sentence first (optional), then put ONLY the exact text to be copied inside a fenced block that starts with ```copy on its own line and ends with ``` on its own line. Nothing else may go inside that block: no title, no explanation, no quotes, no markdown symbols. Put any extra explanation after the block.';
 const looksHausa = (text: string) => /\b(ina|yaya|sannu|kai|wannan|wancan|domin|don|nake|zan|zaka|zaki|yanzu|menene|me ya|ban|ko|amma|kuma|fassara|bani|taimaka|inaso|ina so|abu|abin|gaya|fadamin|faɗa|nan|yau|jiya)\b/i.test(text);
@@ -1443,6 +1549,9 @@ function MessageBubble({
   onShare,
   onMore,
   onOpenAttachment,
+  onSaveFile,
+  onSaveAllFiles,
+  textColor,
 }: {
   message: ChatMessage;
   onOpenImage: (uri: string) => void;
@@ -1457,6 +1566,9 @@ function MessageBubble({
   onShare?: (message: ChatMessage) => void;
   onMore?: (message: ChatMessage) => void;
   onOpenAttachment?: (attachment: any) => void;
+  onSaveFile?: (file: SplitFile) => void;
+  onSaveAllFiles?: (files: SplitFile[]) => void;
+  textColor?: string;
 }) {
   const isUser =
     message.role === 'user';
@@ -1496,24 +1608,69 @@ function MessageBubble({
               <Ionicons name="open-outline" size={16} color="#ffffff" style={{ marginLeft: 8 }} />
             </Pressable>
           ) : null}
-          {message.image ? (
+          {((message as any).extraAttachments || []).map((attachment: any, index: number) => (
             <Pressable
-              onPress={() => onOpenImage(message.image!.uri)}
+              key={`extra-file-${index}`}
+              onPress={() => onOpenAttachment?.(attachment)}
               accessibilityRole="button"
-              accessibilityLabel="Open image full screen"
-              style={{ alignSelf: 'flex-start', maxWidth: '100%' }}
+              accessibilityLabel="Open attached file"
+              style={{ flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', maxWidth: '100%', marginBottom: 8, paddingVertical: 8, paddingHorizontal: 10, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.22)' }}
             >
-              <Image
-                source={{ uri: message.image.uri }}
-                style={S().messageImage as React.ComponentProps<typeof Image>['style']}
-                resizeMode="contain"
-              />
+              <Ionicons name={String(attachment.mimeType || '').startsWith('video') ? 'videocam-outline' : String(attachment.mimeType || '').startsWith('audio') ? 'musical-notes-outline' : 'document-text-outline'} size={20} color="#ffffff" style={{ marginRight: 8 }} />
+              <Text style={{ color: '#ffffff', fontSize: 13, fontWeight: '600', flexShrink: 1 }} numberOfLines={1}>{attachment.name}</Text>
+              <Ionicons name="open-outline" size={16} color="#ffffff" style={{ marginLeft: 8 }} />
             </Pressable>
+          ))}
+          {message.image || ((message as any).extraImages || []).length ? (
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', alignSelf: 'flex-start', maxWidth: '100%' }}>
+              {[message.image, ...((message as any).extraImages || [])].filter(Boolean).map((image: any, index: number) => (
+                <Pressable
+                  key={`msg-image-${index}`}
+                  onPress={() => onOpenImage(image.uri)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Open image full screen"
+                  style={{ marginRight: 6 }}
+                >
+                  <Image
+                    source={{ uri: image.uri }}
+                    style={S().messageImage as React.ComponentProps<typeof Image>['style']}
+                    resizeMode="contain"
+                  />
+                </Pressable>
+              ))}
+            </View>
           ) : null}
 
           <View style={S().messageContent}>
             {renderMarkdown(message.content, isUser)}
           </View>
+
+          {((message as any).splitFiles || []).length ? (
+            <View style={{ marginTop: 10 }}>
+              {((message as any).splitFiles as SplitFile[]).map((file, index) => (
+                <Pressable
+                  key={`split-file-${index}`}
+                  onPress={() => onSaveFile?.(file)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Save ${file.name}`}
+                  style={{ flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', maxWidth: '100%', marginBottom: 8, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 12, backgroundColor: 'rgba(127,127,127,0.18)' }}
+                >
+                  <Ionicons name="document-text-outline" size={20} color={activeIcon} style={{ marginRight: 8 }} />
+                  <Text style={{ color: textColor || '#f0f7ff', fontSize: 14, fontWeight: '600', flexShrink: 1 }} numberOfLines={1}>{file.name}</Text>
+                  <Ionicons name="download-outline" size={18} color={activeIcon} style={{ marginLeft: 10 }} />
+                </Pressable>
+              ))}
+              <Pressable
+                onPress={() => onSaveAllFiles?.((message as any).splitFiles as SplitFile[])}
+                accessibilityRole="button"
+                accessibilityLabel="Download all files"
+                style={{ flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 12, backgroundColor: activeIcon }}
+              >
+                <Ionicons name="download-outline" size={18} color="#ffffff" style={{ marginRight: 8 }} />
+                <Text style={{ color: '#ffffff', fontSize: 14, fontWeight: '700' }}>Download all</Text>
+              </Pressable>
+            </View>
+          ) : null}
         </View>
       </View>
 
@@ -1631,8 +1788,26 @@ function EmptyState({
   );
 }
 
+// ═════════ Limit alert detection, social sign-in modules, shared types ═════════
+const LIMIT_MESSAGE_REGEX = /limit|quota|too many requests|\b429\b|exceeded|upgrade|used all|questions for today|come back tomorrow/i;
+
+let GoogleSigninModule: any = null;
+try { GoogleSigninModule = require('@react-native-google-signin/google-signin'); } catch (_error) { GoogleSigninModule = null; }
+let AppleAuthModule: any = null;
+try { AppleAuthModule = require('expo-apple-authentication'); } catch (_error) { AppleAuthModule = null; }
+// Paste the Web client ID from Firebase (Authentication > Sign-in method > Google) between the quotes.
+const GOOGLE_WEB_CLIENT_ID = '';
+
+type VoiceModel = 'standard' | 'live' | 'advanced';
+const VOICE_MODELS: { key: VoiceModel; label: string; desc: string }[] = [
+  { key: 'live', label: 'Live', desc: 'Hands-free: I listen again after every answer' },
+  { key: 'advanced', label: 'Advanced', desc: 'Live, plus your words appear while you speak' },
+  { key: 'standard', label: 'Standard', desc: 'Tap the microphone each time you speak' },
+];
+type ChatMeta = { pinned?: boolean; archived?: boolean; locked?: boolean; projectId?: string };
+
 function HomeScreenMain() {
-    const [iconFontsLoaded] = useFonts({
+    const [iconFontsLoaded, iconFontsError] = useFonts({
     ...Ionicons.font,
     ...MaterialCommunityIcons.font,
   });
@@ -1641,6 +1816,7 @@ function HomeScreenMain() {
 
   const [authMode, setAuthMode] =
     useState<'login' | 'signup'>('login');
+  const [authView, setAuthView] = useState<'choose' | 'email'>('choose');
 
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
@@ -1662,11 +1838,15 @@ const systemColorScheme = useColorScheme();
 const [appearanceMode, setAppearanceMode] = useState<'system' | 'light' | 'dark'>('system');
 const [accentColor, setAccentColor] = useState('#3182ce');
 const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+const [locationEnabled, setLocationEnabled] = useState(false);
+const [locationInfo, setLocationInfo] = useState<PlaceInfo | null>(null);
+const locationRef = useRef<PlaceInfo | null>(null);
 const [appLanguage, setAppLanguage] = useState<string>('English');
 const [appCountry, setAppCountry] = useState('NG');
 const [notifPrefs, setNotifPrefs] = useState<Record<string, boolean>>({ responses: true, library: true, projects: true, memory: true, tips: true, usage: true });
 const [settingsLoaded, setSettingsLoaded] = useState(false);
 const [voiceId, setVoiceId] = useState('');
+const [voiceModel, setVoiceModel] = useState<VoiceModel>('standard');
 const [voiceLanguage, setVoiceLanguage] = useState('');
 const [voiceVisible, setVoiceVisible] = useState(false);
 const [voicePickerVisible, setVoicePickerVisible] = useState(false);
@@ -1735,10 +1915,12 @@ uiLightMode = isLightTheme;
           if (saved.appearanceMode === 'system' || saved.appearanceMode === 'light' || saved.appearanceMode === 'dark') setAppearanceMode(saved.appearanceMode);
           if (typeof saved.accentColor === 'string') setAccentColor(saved.accentColor);
           if (typeof saved.notificationsEnabled === 'boolean') setNotificationsEnabled(saved.notificationsEnabled);
+          if (typeof saved.locationEnabled === 'boolean') setLocationEnabled(saved.locationEnabled);
           if (typeof saved.appLanguage === 'string' && LANGUAGES.some((item) => item.name === saved.appLanguage)) setAppLanguage(saved.appLanguage);
           if (typeof saved.appCountry === 'string' && saved.appCountry.length === 2) setAppCountry(saved.appCountry);
           if (saved.notifPrefs && typeof saved.notifPrefs === 'object') setNotifPrefs((current) => ({ ...current, ...saved.notifPrefs }));
           if (typeof saved.voiceId === 'string') setVoiceId(saved.voiceId);
+          if (saved.voiceModel === 'standard' || saved.voiceModel === 'live' || saved.voiceModel === 'advanced') setVoiceModel(saved.voiceModel);
           if (typeof saved.voiceLanguage === 'string') setVoiceLanguage(saved.voiceLanguage);
           if (typeof saved.speechRate === 'number' && saved.speechRate >= 0.4 && saved.speechRate <= 1.5) setSpeechRate(saved.speechRate);
         }
@@ -1754,9 +1936,9 @@ uiLightMode = isLightTheme;
   useEffect(() => {
     if (!settingsLoaded) return;
     AsyncStorage.setItem('ik-tech-ai:settings:v1', JSON.stringify({
-      appearanceMode, accentColor, notificationsEnabled, appLanguage, appCountry, notifPrefs, voiceId, voiceLanguage, speechRate,
+      appearanceMode, accentColor, notificationsEnabled, locationEnabled, appLanguage, appCountry, notifPrefs, voiceId, voiceLanguage, speechRate, voiceModel,
     })).catch((error) => console.warn('[IK TECH AI] Could not save settings', error));
-  }, [settingsLoaded, appearanceMode, accentColor, notificationsEnabled, appLanguage, appCountry, notifPrefs, voiceId, voiceLanguage, speechRate]);
+  }, [settingsLoaded, appearanceMode, accentColor, notificationsEnabled, locationEnabled, appLanguage, appCountry, notifPrefs, voiceId, voiceLanguage, speechRate, voiceModel]);
 
   const [profileImage, setProfileImage] = useState<string | null>(null);
   const [profileFullName, setProfileFullName] = useState('');
@@ -1785,7 +1967,11 @@ uiLightMode = isLightTheme;
 
     // PDF, Word, video or audio file waiting to be sent with the next message.
     const [selectedDocument, setSelectedDocument] =
-      useState<{ uri: string; name: string; mimeType: string; text?: string } | null>(null);
+      useState<AttachedDoc | null>(null);
+
+    // Extra photos / files picked together with the first one (the user can send several at once).
+    const [extraImages, setExtraImages] = useState<SelectedImage[]>([]);
+    const [extraDocuments, setExtraDocuments] = useState<AttachedDoc[]>([]);
 
     const [isStreaming, setIsStreaming] =
       useState(false);
@@ -1799,6 +1985,13 @@ uiLightMode = isLightTheme;
 
     const [voiceModeVisible, setVoiceModeVisible] =
       useState(false);
+    const [interimText, setInterimText] = useState('');
+    const voiceModelRef = useRef<VoiceModel>('standard');
+    const voiceModeVisibleRef = useRef(false);
+    const autoListenRef = useRef<() => void>(() => {});
+    const liveRetryRef = useRef(0);
+    voiceModelRef.current = voiceModel;
+    voiceModeVisibleRef.current = voiceModeVisible;
 
     const [historyVisible, setHistoryVisible] =
       useState(false);
@@ -1811,6 +2004,16 @@ uiLightMode = isLightTheme;
     const [mediaViewer, setMediaViewer] = useState<MediaItem | null>(null);
     const [historySearchOpen, setHistorySearchOpen] = useState(false);
     const [historySearchText, setHistorySearchText] = useState('');
+    const [chatMeta, setChatMeta] = useState<Record<string, ChatMeta>>({});
+    const [chatMetaLoaded, setChatMetaLoaded] = useState(false);
+    const [chatPin, setChatPin] = useState('');
+    const [unlockedChatIds, setUnlockedChatIds] = useState<string[]>([]);
+    const [showArchived, setShowArchived] = useState(false);
+    const [chatDialog, setChatDialog] = useState<null | { type: 'menu' | 'rename' | 'project' | 'pin'; item: ChatConversation; y?: number; pinMode?: 'create' | 'unlock' | 'remove' }>(null);
+    const [renameText, setRenameText] = useState('');
+    const [pinInput, setPinInput] = useState('');
+    const [pinError, setPinError] = useState('');
+    const windowHeight = useWindowDimensions().height;
     const menuTouchStartX = useRef<number | null>(null);
 
     const [libraryVisible, setLibraryVisible] = useState(false);
@@ -2688,6 +2891,9 @@ const handleForgotPassword = useCallback(async () => {
         setMessages([]);
         setDraft('');
         setSelectedImage(null);
+        setSelectedDocument(null);
+        setExtraImages([]);
+        setExtraDocuments([]);
         setErrorMessage(null);
         setHistoryVisible(false);
 
@@ -2713,6 +2919,9 @@ const handleForgotPassword = useCallback(async () => {
 
           setDraft('');
           setSelectedImage(null);
+          setSelectedDocument(null);
+          setExtraImages([]);
+          setExtraDocuments([]);
           setErrorMessage(null);
           setHistoryVisible(false);
 
@@ -2775,6 +2984,9 @@ const handleForgotPassword = useCallback(async () => {
           setMessages([]);
           setDraft('');
           setSelectedImage(null);
+          setSelectedDocument(null);
+          setExtraImages([]);
+          setExtraDocuments([]);
           setHistoryVisible(false);
 
           Haptics.notificationAsync(
@@ -2847,35 +3059,77 @@ const handleForgotPassword = useCallback(async () => {
         );
       }
     }, []);
+    // Adds photos/files to the message being written (the first one is the main item, the rest are extras).
+    const addAttachments = useCallback((images: SelectedImage[], docs: AttachedDoc[]) => {
+      const used = (selectedImage ? 1 : 0) + extraImages.length + (selectedDocument ? 1 : 0) + extraDocuments.length;
+      let room = Math.max(0, MAX_ATTACHMENTS - used);
+      const imgs = images.slice(0, room);
+      room -= imgs.length;
+      const dcs = docs.slice(0, room);
+      if (imgs.length < images.length || dcs.length < docs.length) {
+        Alert.alert('Too many items', `You can send up to ${MAX_ATTACHMENTS} photos and files in one message. The extra ones were not added.`);
+      }
+      if (imgs.length) {
+        if (!selectedImage) {
+          setSelectedImage(imgs[0]);
+          if (imgs.length > 1) setExtraImages((current) => [...current, ...imgs.slice(1)]);
+        } else {
+          setExtraImages((current) => [...current, ...imgs]);
+        }
+      }
+      if (dcs.length) {
+        if (!selectedDocument) {
+          setSelectedDocument(dcs[0]);
+          if (dcs.length > 1) setExtraDocuments((current) => [...current, ...dcs.slice(1)]);
+        } else {
+          setExtraDocuments((current) => [...current, ...dcs]);
+        }
+      }
+    }, [selectedImage, selectedDocument, extraImages, extraDocuments]);
+
+    const removeImageAt = useCallback((index: number) => {
+      const all = (selectedImage ? [selectedImage, ...extraImages] : []).slice();
+      all.splice(index, 1);
+      setSelectedImage(all[0] ?? null);
+      setExtraImages(all.slice(1));
+    }, [selectedImage, extraImages]);
+
+    const removeDocumentAt = useCallback((index: number) => {
+      const all = (selectedDocument ? [selectedDocument, ...extraDocuments] : []).slice();
+      all.splice(index, 1);
+      setSelectedDocument(all[0] ?? null);
+      setExtraDocuments(all.slice(1));
+    }, [selectedDocument, extraDocuments]);
+
+    const convertImageAsset = useCallback(async (asset: { uri: string; mimeType?: string | null; base64?: string | null }): Promise<SelectedImage> => {
+      if (asset.base64) {
+        const mime = asset.mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
+        return { uri: `data:${mime};base64,${asset.base64}`, mimeType: mime };
+      }
+      const imageResponse = await fetch(asset.uri);
+      const imageBlob = await imageResponse.blob();
+      const imageDataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          if (typeof reader.result === 'string') resolve(reader.result);
+          else reject(new Error('Could not convert image to data URL.'));
+        };
+        reader.onerror = () => reject(new Error('Could not read image file.'));
+        reader.readAsDataURL(imageBlob);
+      });
+      return { uri: imageDataUrl, mimeType: asset.mimeType || imageBlob.type || 'image/jpeg' };
+    }, []);
+
     const handleAttachImageAsset = useCallback(async (asset: { uri: string; mimeType?: string | null; base64?: string | null }) => {
       try {
-              if (asset.base64) {
-          const mime = asset.mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
-          setSelectedImage({ uri: `data:${mime};base64,${asset.base64}`, mimeType: mime });
-          setErrorMessage(null);
-          return;
-              }
-        const imageResponse = await fetch(asset.uri);
-        const imageBlob = await imageResponse.blob();
-        const imageDataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            if (typeof reader.result === 'string') resolve(reader.result);
-            else reject(new Error('Could not convert image to data URL.'));
-          };
-          reader.onerror = () => reject(new Error('Could not read image file.'));
-          reader.readAsDataURL(imageBlob);
-        });
-        setSelectedImage({
-          uri: imageDataUrl,
-          mimeType: asset.mimeType || imageBlob.type || 'image/jpeg',
-        });
+        const image = await convertImageAsset(asset);
+        addAttachments([image], []);
         setErrorMessage(null);
       } catch (error) {
         console.error('[IK TECH AI] Image import error:', error);
         setErrorMessage('Could not read this image. Please choose another image.');
       }
-    }, []);
+    }, [convertImageAsset, addAttachments]);
 
     const handleChooseFromPhotos = useCallback(async () => {
       if (isStreaming) return;
@@ -2887,16 +3141,27 @@ const handleForgotPassword = useCallback(async () => {
         }
         const result = await ImagePicker.launchImageLibraryAsync({
           mediaTypes: ['images'],
-          quality: 0.8,
-          selectionLimit: 1,
+          quality: 0.7,
+          allowsMultipleSelection: true,
+          selectionLimit: MAX_ATTACHMENTS,
         });
-        if (result.canceled || !result.assets?.[0]?.uri) return;
-        await handleAttachImageAsset(result.assets[0]);
+        if (result.canceled || !result.assets?.length) return;
+        const images: SelectedImage[] = [];
+        for (const asset of result.assets) {
+          if (!asset.uri) continue;
+          try { images.push(await convertImageAsset(asset)); } catch (readError) { console.error('[IK TECH AI] Photo read error:', readError); }
+        }
+        if (!images.length) {
+          setErrorMessage('Could not read these images. Please choose other images.');
+          return;
+        }
+        addAttachments(images, []);
+        setErrorMessage(null);
       } catch (error) {
         console.error('[IK TECH AI] Photos picker error:', error);
         setErrorMessage('Could not open Photos. Please try again.');
       }
-    }, [isStreaming, handleAttachImageAsset]);
+    }, [isStreaming, convertImageAsset, addAttachments]);
 
     const handleTakePhoto = useCallback(async () => {
       if (isStreaming) return;
@@ -2925,58 +3190,60 @@ const handleForgotPassword = useCallback(async () => {
         const result = await DocumentPicker.getDocumentAsync({
           type: '*/*',
           copyToCacheDirectory: true,
-          multiple: false,
+          multiple: true,
         });
-        console.log('[IK TECH AI] File picker result:', result.canceled ? 'cancelled' : result.assets?.[0]?.name);
-        if (result.canceled || !result.assets?.[0]?.uri) return;
-        const asset = result.assets[0];
-        const name = asset.name || 'selected file';
-        const mimeType = (asset.mimeType || '').toLowerCase();
-        const extension = name.split('.').pop()?.toLowerCase() || '';
-        const isImage = mimeType.startsWith('image/') || ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic'].includes(extension);
-        if (isImage) {
-          await handleAttachImageAsset({ uri: asset.uri, mimeType: asset.mimeType });
-          return;
-        }
-        const isReadableText = mimeType.startsWith('text/') || TEXT_FILE_EXTENSIONS.includes(extension);
-        if (isReadableText) {
-          try {
-            let content = '';
-            if (Platform.OS === 'web') {
-              const response = await fetch(asset.uri);
-              if (!response.ok) throw new Error(`Could not read file (${response.status}).`);
-              content = await response.text();
-            } else {
-              const FileSystem = await import('expo-file-system/legacy');
-              content = await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.UTF8 });
-            }
-            if (!content.trim()) {
-              Alert.alert('Empty file', 'This file does not contain readable text.');
-              return;
-            }
-            setSelectedDocument({ uri: asset.uri, name, mimeType: 'text/plain', text: content.slice(0, 24000) });
-            return;
-          } catch (readError) {
-            console.error('[IK TECH AI] Text file read error:', readError);
-            Alert.alert('Could not read file', 'This text file could not be opened. Try another file.');
-            return;
+        console.log('[IK TECH AI] File picker result:', result.canceled ? 'cancelled' : `${result.assets?.length} item(s)`);
+        if (result.canceled || !result.assets?.length) return;
+        const images: SelectedImage[] = [];
+        const docs: AttachedDoc[] = [];
+        const skipped: string[] = [];
+        for (const asset of result.assets) {
+          if (!asset.uri) continue;
+          const name = asset.name || 'selected file';
+          const mimeType = (asset.mimeType || '').toLowerCase();
+          const extension = name.split('.').pop()?.toLowerCase() || '';
+          const isImage = mimeType.startsWith('image/') || ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic'].includes(extension);
+          if (isImage) {
+            try { images.push(await convertImageAsset({ uri: asset.uri, mimeType: asset.mimeType })); } catch (_error) { skipped.push(name); }
+            continue;
           }
-        }
-        const attachable = ATTACHMENT_TYPES[extension];
-        if (attachable) {
-          if (typeof asset.size === 'number' && asset.size > 10 * 1024 * 1024) {
-            Alert.alert('File too large', 'Please choose a file smaller than 10 MB.');
-            return;
+          const isReadableText = mimeType.startsWith('text/') || TEXT_FILE_EXTENSIONS.includes(extension);
+          if (isReadableText) {
+            try {
+              let content = '';
+              if (Platform.OS === 'web') {
+                const response = await fetch(asset.uri);
+                if (!response.ok) throw new Error(`Could not read file (${response.status}).`);
+                content = await response.text();
+              } else {
+                const FileSystem = await import('expo-file-system/legacy');
+                content = await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.UTF8 });
+              }
+              if (!content.trim()) { skipped.push(`${name} (empty)`); continue; }
+              docs.push({ uri: asset.uri, name, mimeType: 'text/plain', text: content.slice(0, 24000), fullText: content });
+            } catch (readError) {
+              console.error('[IK TECH AI] Text file read error:', readError);
+              skipped.push(name);
+            }
+            continue;
           }
-          setSelectedDocument({ uri: asset.uri, name, mimeType: attachable });
-          return;
+          const attachable = ATTACHMENT_TYPES[extension];
+          if (attachable) {
+            if (typeof asset.size === 'number' && asset.size > 10 * 1024 * 1024) { skipped.push(`${name} (over 10 MB)`); continue; }
+            docs.push({ uri: asset.uri, name, mimeType: attachable });
+            continue;
+          }
+          skipped.push(`${name} (type not supported)`);
         }
-        Alert.alert('File type not supported', 'You can attach images, PDF, Word (.docx), video, audio, and text or code files. This file type (.' + (extension || 'unknown') + ') is not supported.');
+        if (images.length || docs.length) addAttachments(images, docs);
+        if (skipped.length) {
+          Alert.alert('Some files were not added', `${skipped.join('\n')}\n\nYou can attach images, PDF, Word (.docx), video, audio, and text or code files.`);
+        }
       } catch (error) {
         console.error('[IK TECH AI] Files picker error:', error);
         Alert.alert('Files', 'Could not open Files. Please try again.');
       }
-    }, [isStreaming, handleAttachImageAsset]);
+    }, [isStreaming, convertImageAsset, addAttachments]);
 
     const chooseImageForEditing = useCallback(async () => {
       try {
@@ -3084,7 +3351,7 @@ const handleForgotPassword = useCallback(async () => {
             forcedText ?? draft
           ).trim();
 
-          if (!text && !selectedImage && !selectedDocument) {
+          if (!text && !selectedImage && !selectedDocument && !extraImages.length && !extraDocuments.length) {
             return;
           }
 
@@ -3092,22 +3359,35 @@ const handleForgotPassword = useCallback(async () => {
 
           setErrorMessage(null);
 
+          const allImagesForSend: SelectedImage[] = selectedImage ? [selectedImage, ...extraImages] : [];
+          const allDocsForSend: AttachedDoc[] = selectedDocument ? [selectedDocument, ...extraDocuments] : [];
+          const stripDoc = (doc: AttachedDoc) => { const { fullText: _omit, ...rest } = doc; return rest; };
+          // "Split this file into 6 files / documents" is done on the phone, so the whole file is kept.
+          const splitPlan = detectSplitRequest(text);
+          const splitSource = splitPlan ? allDocsForSend.find((doc) => typeof doc.fullText === 'string' && doc.fullText.trim().length > 0) : undefined;
+
           const userMessage: ChatMessage = {
             id: generateMessageId(),
             role: 'user',
             content:
               text ||
-              (selectedDocument ? (selectedDocument.mimeType.startsWith('audio') ? 'Please listen to the attached audio recording, write down exactly what is said (transcribe it), then give a short summary.' : 'Please read the attached file and tell me what is in it.') : 'Please analyze this image.'),
+              (allImagesForSend.length + allDocsForSend.length > 1 ? 'Please look at all the attached items and tell me what is in them.' : selectedDocument ? (selectedDocument.mimeType.startsWith('audio') ? 'Please listen to the attached audio recording, write down exactly what is said (transcribe it), then give a short summary.' : 'Please read the attached file and tell me what is in it.') : 'Please analyze this image.'),
             image:
               selectedImage ?? undefined,
             attachment:
-              selectedDocument ?? undefined,
+              selectedDocument ? stripDoc(selectedDocument) : undefined,
+            ...(extraImages.length ? { extraImages } : {}),
+            ...(extraDocuments.length ? { extraAttachments: extraDocuments.map(stripDoc) } : {}),
           };
           // Keep a copy of each image the user sends in the Library on this device.
-          if (selectedImage?.uri && user) {
-            setLibraryImages((current) => current.some((item) => item.uri === selectedImage.uri)
-              ? current
-              : [{ id: `chat-image-${Date.now()}`, uri: selectedImage.uri, name: `Chat image ${new Date().toLocaleDateString()}`, createdAt: Date.now() }, ...current]);
+          if (allImagesForSend.length && user) {
+            setLibraryImages((current) => {
+              const known = new Set(current.map((item) => item.uri));
+              const fresh = allImagesForSend
+                .filter((image) => image.uri && !known.has(image.uri))
+                .map((image, index) => ({ id: `chat-image-${Date.now()}-${index}`, uri: image.uri, name: `Chat image ${new Date().toLocaleDateString()}`, createdAt: Date.now() }));
+              return fresh.length ? [...fresh, ...current] : current;
+            });
           }
 
           let conversation =
@@ -3165,6 +3445,8 @@ const handleForgotPassword = useCallback(async () => {
           setDraft('');
           setSelectedImage(null);
           setSelectedDocument(null);
+          setExtraImages([]);
+          setExtraDocuments([]);
           setIsStreaming(true);
 
           Haptics.impactAsync(
@@ -3179,6 +3461,7 @@ const handleForgotPassword = useCallback(async () => {
 
           let assistantContent = '';
           let generatedImage: { uri: string; mimeType?: string } | undefined;
+          let splitFilesOut: SplitFile[] | undefined;
 
           try {
             await saveConversation(
@@ -3223,6 +3506,20 @@ const handleForgotPassword = useCallback(async () => {
                   ...current,
                 ]);
               }
+            } else if (splitPlan && splitSource) {
+              const hausaReply = appLanguage === 'Hausa' || looksHausa(text);
+              appendAssistantChunk(hausaReply ? 'Ina raba file ɗin…' : 'Splitting your file…');
+              const pieces = splitTextIntoParts(splitSource.fullText || '', splitPlan.parts);
+              splitFilesOut = await buildSplitFiles(splitSource.name, pieces, splitPlan.as);
+              const total = splitFilesOut.length;
+              assistantContent = hausaReply
+                ? `Na raba "${splitSource.name}" gida ${total} (a matsayin ${splitPlan.as === 'document' ? 'document' : 'files'}). Danna kowanne a ƙasa don ajiye shi, ko ka danna "Download all" don ajiye duka. Idan ka haɗa su bisa tsari daga 1 zuwa ${total}, za su dawo guda ɗaya daidai da asalin file ɗin.`
+                : `I split "${splitSource.name}" into ${total} ${splitPlan.as === 'document' ? 'documents' : 'files'}. Tap a file below to save it, or tap "Download all". Join them in order from 1 to ${total} and you get the original file back exactly.`;
+            } else if (splitPlan && allDocsForSend.length) {
+              const hausaReply = appLanguage === 'Hausa' || looksHausa(text);
+              assistantContent = hausaReply
+                ? 'Zan iya raba text ko code file (kamar .tsx, .js, .txt, .json) ne kawai. Wannan file ɗin ba irin su ba ne.'
+                : 'I can split text or code files (such as .tsx, .js, .txt, .json). This file is not one of those types.';
             } else if (localDateTimeAnswer) {
               appendAssistantChunk(localDateTimeAnswer);
             } else {
@@ -3252,10 +3549,55 @@ const handleForgotPassword = useCallback(async () => {
               const latestUserText = String((updatedMessages[updatedMessages.length - 1] as any)?.content || '');
               if (appLanguage === 'Hausa' || looksHausa(latestUserText)) contextLines.push(HAUSA_STYLE_HINT);
               if (COPY_INTENT.test(latestUserText)) contextLines.push(COPY_STYLE_HINT);
+              contextLines.push(PLACE_KNOWLEDGE_HINT);
+              if (locationEnabled) {
+                let place = locationRef.current;
+                if (LOCATION_QUESTION.test(latestUserText) || !place || Date.now() - place.updatedAt > 10 * 60 * 1000) {
+                  place = (await refreshLocation(false)) || place;
+                }
+                contextLines.push(LOCATION_ANSWER_HINT);
+                if (place) contextLines.push(`CURRENT DEVICE LOCATION (approximate, from the user's phone): ${placeToLine(place)}.`);
+              } else if (LOCATION_QUESTION.test(latestUserText)) {
+                contextLines.push('The user asked about their own location but has NOT turned on Location. Politely tell them to turn on "Location" in Settings so you can know where they are.');
+              }
+              {
+                // Earlier chats stay available in every new chat, so the user can ask "what did we talk about?".
+                const recallAsked = PAST_CHAT_QUESTION.test(latestUserText);
+                const otherChats = [...history]
+                  .filter((item) => item.id !== conversationWithUser.id && (item.messages || []).length)
+                  .sort((a, b) => b.updatedAt - a.updatedAt)
+                  .slice(0, recallAsked ? 15 : 6);
+                if (otherChats.length) {
+                  const digestText = otherChats.map((item) => {
+                    const when = new Date(item.updatedAt).toLocaleDateString();
+                    const lines = (item.messages || []).filter((m: any) => m.content).slice(recallAsked ? -8 : -2)
+                      .map((m: any) => `${m.role === 'user' ? 'User' : 'AI'}: ${String(m.content).replace(/\s+/g, ' ').slice(0, recallAsked ? 220 : 90)}`).join(' | ');
+                    return `• “${item.title}” (${when}): ${lines}`;
+                  }).join('\n').slice(0, recallAsked ? 7000 : 1500);
+                  contextLines.push(`PREVIOUS CHATS of this same user (older conversations, newest first). If the user asks about something they discussed before, answer from these; if it is not here, say you do not see it. Do not mention them otherwise:\n${digestText}`);
+                }
+              }
               const lastUser = updatedMessages[updatedMessages.length - 1];
               const messagesBeforeCurrent = updatedMessages.slice(0, -1);
-              const messagesForAI: ChatMessage[] = contextLines.length && lastUser
-                ? [...messagesBeforeCurrent, { id: 'ik-tech-private-saved-context', role: 'assistant', content: `Private saved context for continuity. Use naturally when relevant; do not repeat it unless the user asks.\n${contextLines.join('\n')}` }, lastUser]
+              // Extra photos/files are sent as their own small turns, because each message carries one image and one file.
+              const extraForAI: ChatMessage[] = [];
+              const extraTotal = extraImages.length + extraDocuments.length + 1;
+              let extraNumber = 1;
+              extraImages.forEach((image) => {
+                extraNumber += 1;
+                extraForAI.push({ id: generateMessageId(), role: 'user', content: `Attached item ${extraNumber} of ${extraTotal}. Keep it in mind together with the other attached items. My question comes next.`, image } as ChatMessage);
+                extraForAI.push({ id: generateMessageId(), role: 'assistant', content: 'Got it.' });
+              });
+              extraDocuments.forEach((doc) => {
+                extraNumber += 1;
+                extraForAI.push({ id: generateMessageId(), role: 'user', content: `Attached item ${extraNumber} of ${extraTotal}. Keep it in mind together with the other attached items. My question comes next.`, attachment: stripDoc(doc) } as ChatMessage);
+                extraForAI.push({ id: generateMessageId(), role: 'assistant', content: 'Got it.' });
+              });
+              const contextMessages: ChatMessage[] = contextLines.length
+                ? [{ id: 'ik-tech-private-saved-context', role: 'assistant', content: `Private saved context for continuity. Use naturally when relevant; do not repeat it unless the user asks.\n${contextLines.join('\n')}` }]
+                : [];
+              const messagesForAI: ChatMessage[] = lastUser && (contextLines.length || extraForAI.length)
+                ? [...messagesBeforeCurrent, ...contextMessages, ...extraForAI, lastUser]
                 : updatedMessages;
               await streamChat(messagesForAI, appendAssistantChunk);
             }
@@ -3268,6 +3610,7 @@ const handleForgotPassword = useCallback(async () => {
                 assistantContent ||
                 'I could not generate a response.',
               image: generatedImage,
+              ...(splitFilesOut ? { splitFiles: splitFilesOut } : {}),
             };
 
             const finalMessages = [
@@ -3323,6 +3666,13 @@ const handleForgotPassword = useCallback(async () => {
 
                   onDone: () => {
                     setIsSpeaking(false);
+
+                    if (
+                      voiceModelRef.current !== 'standard' &&
+                      voiceModeVisibleRef.current
+                    ) {
+                      setTimeout(() => autoListenRef.current(), 500);
+                    }
                   },
 
                   onStopped: () => {
@@ -3373,6 +3723,8 @@ const handleForgotPassword = useCallback(async () => {
           scrollToBottom,
           selectedImage,
           selectedDocument,
+          extraImages,
+          extraDocuments,
           user,
           memoryItems,
           memoryEnabled,
@@ -3392,9 +3744,15 @@ const handleForgotPassword = useCallback(async () => {
     if (isStreaming) return;
     setErrorMessage(null);
     setVoiceModeVisible(true);
+    setInterimText('');
+    liveRetryRef.current = 0;
 
     Speech.stop().catch(() => {});
     setIsSpeaking(false);
+
+    if (voiceModelRef.current !== 'standard') {
+    setTimeout(() => autoListenRef.current(), 700);
+    }
     }, [isStreaming]);
 
     const handleCloseVoiceMode =
@@ -3461,11 +3819,23 @@ const handleForgotPassword = useCallback(async () => {
     return;
     }
 
+    liveRetryRef.current = 0;
+    setInterimText('');
+
     handleSend(
     transcript,
     true,
     );
     }
+    },
+    );
+
+    useSpeechRecognitionEvent(
+    'result',
+    (event) => {
+    if (voiceModelRef.current !== 'advanced') return;
+    const partial = event?.results?.[0]?.transcript?.trim() || '';
+    setInterimText(event?.isFinal === false ? partial : '');
     },
     );
 
@@ -3504,6 +3874,16 @@ const handleForgotPassword = useCallback(async () => {
     event?.error ===
     'no-speech'
     ) {
+    if (
+    voiceModelRef.current !== 'standard' &&
+    voiceModeVisibleRef.current &&
+    liveRetryRef.current < 2
+    ) {
+    liveRetryRef.current += 1;
+    setTimeout(() => autoListenRef.current(), 400);
+    return;
+    }
+
     setErrorMessage(
     'No speech was detected. Please try again.',
     );
@@ -3558,7 +3938,7 @@ const handleForgotPassword = useCallback(async () => {
     ExpoSpeechRecognitionModule.start(
     {
     lang: speechLangRef.current,
-    interimResults: false,
+    interimResults: voiceModelRef.current === 'advanced',
     continuous: false,
     },
     );
@@ -3584,6 +3964,18 @@ const handleForgotPassword = useCallback(async () => {
     isListening,
     isStreaming,
     ]);
+
+    autoListenRef.current = () => {
+    if (
+    voiceModelRef.current === 'standard' ||
+    !voiceModeVisibleRef.current ||
+    recognitionRef.current
+    ) {
+    return;
+    }
+
+    handleToggleVoice();
+    };
 
     useEffect(() => {
     return () => {
@@ -3658,16 +4050,23 @@ const handleForgotPassword = useCallback(async () => {
       !!selectedImage ||
       !!selectedDocument;
 
+    // Everything waiting to be sent with the next message (first item + extras).
+    const attachedImages: SelectedImage[] = selectedImage ? [selectedImage, ...extraImages] : [];
+    const attachedDocuments: AttachedDoc[] = selectedDocument ? [selectedDocument, ...extraDocuments] : [];
+
     const sortedHistory =
       useMemo(
         () =>
-          [...history].sort(
-            (a, b) =>
-              b.updatedAt -
-              a.updatedAt,
+          [...history]
+            .filter((item) => (showArchived ? !!chatMeta[item.id]?.archived : !chatMeta[item.id]?.archived))
+            .sort(
+              (a, b) =>
+                (Number(!!chatMeta[b.id]?.pinned) - Number(!!chatMeta[a.id]?.pinned)) ||
+                (b.updatedAt - a.updatedAt),
             ),
-            [history],
-            );
+        [history, chatMeta, showArchived],
+      );
+    const archivedCount = history.filter((item) => !!chatMeta[item.id]?.archived).length;
 
     const visibleHistory = useMemo(() => {
       const query = historySearchText.trim().toLowerCase();
@@ -3678,6 +4077,147 @@ const handleForgotPassword = useCallback(async () => {
         return title.includes(query) || lastMessage.toLowerCase().includes(query);
       });
     }, [sortedHistory, historySearchText]);
+
+    // ═════════ Chat menu: pin, rename, add to project, archive, lock, delete ═════════
+    useEffect(() => {
+      let active = true;
+      (async () => {
+        try {
+          const raw = await AsyncStorage.getItem('ik-tech-ai:chatmeta:v1');
+          if (raw && active) {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') setChatMeta(parsed);
+          }
+          const pin = await AsyncStorage.getItem('ik-tech-ai:chatpin:v1');
+          if (pin && active) setChatPin(pin);
+        } catch (error) {
+          console.warn('[IK TECH AI] Could not load chat options', error);
+        } finally {
+          if (active) setChatMetaLoaded(true);
+        }
+      })();
+      return () => { active = false; };
+    }, []);
+
+    useEffect(() => {
+      if (!chatMetaLoaded) return;
+      AsyncStorage.setItem('ik-tech-ai:chatmeta:v1', JSON.stringify(chatMeta)).catch(() => {});
+    }, [chatMeta, chatMetaLoaded]);
+
+    const updateChatMeta = useCallback((id: string, patch: Partial<ChatMeta>) => {
+      setChatMeta((current) => {
+        const merged: any = { ...(current[id] || {}), ...patch };
+        Object.keys(merged).forEach((key) => { if (!merged[key]) delete merged[key]; });
+        const next = { ...current };
+        if (Object.keys(merged).length) next[id] = merged; else delete next[id];
+        return next;
+      });
+    }, []);
+
+    const closeChatDialog = useCallback(() => {
+      setChatDialog(null);
+      setPinInput('');
+      setPinError('');
+      setRenameText('');
+    }, []);
+
+    const openChatMenu = (item: ChatConversation, y?: number) => {
+      Haptics.selectionAsync().catch(() => {});
+      setChatDialog({ type: 'menu', item, y });
+    };
+
+    const handleOpenChat = (item: ChatConversation) => {
+      if (chatMeta[item.id]?.locked && !unlockedChatIds.includes(item.id)) {
+        setPinInput('');
+        setPinError('');
+        setChatDialog({ type: 'pin', item, pinMode: 'unlock' });
+        return;
+      }
+      handleSelectConversation(item);
+    };
+
+    const handleRenameSubmit = async () => {
+      if (!chatDialog) return;
+      const title = renameText.trim();
+      if (!title) return;
+      const target = history.find((entry) => entry.id === chatDialog.item.id) || chatDialog.item;
+      closeChatDialog();
+      try {
+        await saveConversation({ ...target, title });
+        setHistory((current) => current.map((entry) => (entry.id === target.id ? { ...entry, title } : entry)));
+      } catch (error) {
+        console.error('[IK TECH AI] Could not rename chat:', error);
+        setErrorMessage('Could not rename this conversation.');
+      }
+    };
+
+    const handleDeleteChat = (item: ChatConversation) => {
+      Alert.alert(
+        'Delete chat?',
+        'This conversation will be deleted permanently.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Delete',
+            style: 'destructive',
+            onPress: async () => {
+              await handleDeleteConversation(item.id);
+              setChatMeta((current) => {
+                const next = { ...current };
+                delete next[item.id];
+                return next;
+              });
+            },
+          },
+        ],
+      );
+    };
+
+    const submitChatPin = () => {
+      if (!chatDialog || chatDialog.type !== 'pin') return;
+      const pin = pinInput.trim();
+      if (!/^\d{4}$/.test(pin)) { setPinError('Enter a 4-digit PIN.'); return; }
+      const { item, pinMode } = chatDialog;
+      if (pinMode === 'create') {
+        setChatPin(pin);
+        AsyncStorage.setItem('ik-tech-ai:chatpin:v1', pin).catch(() => {});
+        updateChatMeta(item.id, { locked: true });
+        closeChatDialog();
+        return;
+      }
+      if (pin !== chatPin) { setPinError('Wrong PIN. Try again.'); setPinInput(''); return; }
+      if (pinMode === 'unlock') {
+        setUnlockedChatIds((current) => (current.includes(item.id) ? current : [...current, item.id]));
+        closeChatDialog();
+        handleSelectConversation(item);
+        return;
+      }
+      updateChatMeta(item.id, { locked: false });
+      closeChatDialog();
+    };
+
+    type ChatMenuRow = { key: string; icon: string; label: string; danger?: boolean; chevron?: boolean; run: () => void };
+    const getChatMenuRows = (item: ChatConversation): ChatMenuRow[] => {
+      const meta = chatMeta[item.id] || {};
+      return [
+        { key: 'pin', icon: meta.pinned ? 'pin' : 'pin-outline', label: meta.pinned ? 'Unpin' : 'Pin', run: () => { updateChatMeta(item.id, { pinned: !meta.pinned }); closeChatDialog(); } },
+        { key: 'rename', icon: 'create-outline', label: 'Rename', run: () => { setRenameText(item.title || ''); setChatDialog({ type: 'rename', item }); } },
+        { key: 'project', icon: 'folder-open-outline', label: 'Add to project', chevron: true, run: () => setChatDialog({ type: 'project', item }) },
+        { key: 'archive', icon: meta.archived ? 'arrow-undo-outline' : 'archive-outline', label: meta.archived ? 'Unarchive' : 'Archive', run: () => { updateChatMeta(item.id, { archived: !meta.archived }); closeChatDialog(); } },
+        {
+          key: 'lock',
+          icon: meta.locked ? 'lock-open-outline' : 'lock-closed-outline',
+          label: meta.locked ? 'Unlock chat' : 'Lock chat',
+          run: () => {
+            if (meta.locked) { setPinInput(''); setPinError(''); setChatDialog({ type: 'pin', item, pinMode: 'remove' }); return; }
+            if (!chatPin) { setPinInput(''); setPinError(''); setChatDialog({ type: 'pin', item, pinMode: 'create' }); return; }
+            updateChatMeta(item.id, { locked: true });
+            closeChatDialog();
+          },
+        },
+        { key: 'delete', icon: 'trash-outline', label: 'Delete', danger: true, run: () => { closeChatDialog(); handleDeleteChat(item); } },
+      ];
+    };
 
     // ═════════ Derived data + handlers: Library, Memory, Notifications, Storage, message actions ═════════
     const hairline = isLightTheme ? '#d5deea' : '#263a54';
@@ -3809,8 +4349,10 @@ const handleForgotPassword = useCallback(async () => {
     if (!requireSignIn()) return;
     const candidates: { uri: string; name: string }[] = [];
     if (selectedImage?.uri) candidates.push({ uri: selectedImage.uri, name: `Attached image ${new Date().toLocaleDateString()}` });
+    extraImages.forEach((image, extraIndex) => { if (image.uri) candidates.push({ uri: image.uri, name: `Attached image ${extraIndex + 2} ${new Date().toLocaleDateString()}` }); });
     messages.forEach((message, index) => {
       if (message.image?.uri) candidates.push({ uri: message.image.uri, name: `${message.role === 'user' ? 'Chat image' : 'AI image'} ${index + 1}` });
+      ((message as any).extraImages || []).forEach((image: SelectedImage, extraIndex: number) => { if (image?.uri) candidates.push({ uri: image.uri, name: `Chat image ${index + 1}.${extraIndex + 2}` }); });
     });
     const existing = new Set(libraryImages.map((item) => item.uri));
     const unique = candidates.filter((item) => item.uri && !existing.has(item.uri));
@@ -4110,7 +4652,6 @@ const handleForgotPassword = useCallback(async () => {
       Alert.alert('Could not open file', 'No app on this phone can open this file type, or the file is no longer available.');
     }
   };
-
   const openAttachment = async (attachment: { uri?: string; name: string; mimeType: string; text?: string }) => {
     if (!attachment) return;
     const mime = (attachment.mimeType || '').toLowerCase();
@@ -4125,6 +4666,40 @@ const handleForgotPassword = useCallback(async () => {
     if (attachment.text) { setLibraryViewer({ item: pseudoItem, text: attachment.text }); return; }
     if (!attachment.uri) { Alert.alert('File not available', 'This file is no longer on this phone. Please attach it again.'); return; }
     await openLibraryItem(pseudoItem);
+  };
+
+  // Save one part (or all parts) made by "split this file into N parts".
+  const splitFileSource = (file: SplitFile): DownloadSource => (file.text !== undefined
+    ? { name: file.name, mimeType: file.mimeType, text: file.text }
+    : { name: file.name, mimeType: file.mimeType, uri: file.uri });
+
+  const saveSplitFile = async (file: SplitFile, quiet = false) => {
+    try {
+      const result = await saveToDevice(splitFileSource(file));
+      if (result === 'saved' && !quiet) showToast('File saved', 'download-outline');
+    } catch (error) {
+      console.error('[IK TECH AI] Save part error:', error);
+      Alert.alert('Could not save file', error instanceof Error ? error.message : 'Please try again.');
+    }
+  };
+
+  const saveSplitFiles = async (files: SplitFile[]) => {
+    if (!files?.length) return;
+    try {
+      if (Platform.OS === 'web') {
+        for (const file of files) {
+          await saveSplitFile(file, true);
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        showToast(`${files.length} files saved`, 'download-outline');
+        return;
+      }
+      const count = await saveManyToDevice(files.map(splitFileSource), 'IK TECH AI parts');
+      if (count > 0) showToast(`${count} file${count === 1 ? '' : 's'} saved`, 'download-outline');
+    } catch (error) {
+      console.error('[IK TECH AI] Save all parts error:', error);
+      Alert.alert('Could not save files', error instanceof Error ? error.message : 'Please try again.');
+    }
   };
 
   // ── Full-screen image viewer (top bar: close, ⋮, download, Share · bottom tools: Edit, Markup, Crop, Remove) ──
@@ -4501,6 +5076,93 @@ const handleForgotPassword = useCallback(async () => {
     }
   };
 
+  // ── Location ──
+  const refreshLocation = useCallback(async (askPermission = false): Promise<PlaceInfo | null> => {
+    try {
+      if (Platform.OS === 'web') {
+        const geolocation = (globalThis as any).navigator?.geolocation;
+        if (!geolocation) return null;
+        const position: any = await new Promise((resolve) => {
+          geolocation.getCurrentPosition(resolve, () => resolve(null), { timeout: 10000, maximumAge: 300000 });
+        });
+        if (!position?.coords) return null;
+        const { latitude, longitude } = position.coords;
+        let address: any = {};
+        try {
+          const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=14&accept-language=en&lat=${latitude}&lon=${longitude}`);
+          address = (await response.json())?.address || {};
+        } catch (_error) { /* keep coordinates only */ }
+        const place: PlaceInfo = {
+          city: String(address.city || address.town || address.village || address.suburb || address.county || '').trim(),
+          state: String(address.state || '').trim(),
+          country: String(address.country || '').trim(),
+          district: String(address.suburb || address.neighbourhood || address.county || '').trim(),
+          street: String(address.road || '').trim(),
+          latitude,
+          longitude,
+          updatedAt: Date.now(),
+        };
+        locationRef.current = place;
+        setLocationInfo(place);
+        return place;
+      }
+      if (!LocationModule) return null;
+      let permission = await LocationModule.getForegroundPermissionsAsync();
+      if (permission.status !== 'granted' && askPermission) permission = await LocationModule.requestForegroundPermissionsAsync();
+      if (permission.status !== 'granted') return null;
+      let position = await LocationModule.getLastKnownPositionAsync().catch(() => null);
+      if (!position) {
+        position = await Promise.race([
+          LocationModule.getCurrentPositionAsync({ accuracy: LocationModule.Accuracy?.Balanced ?? 3 }),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000)),
+        ]).catch(() => null);
+      }
+      if (!position?.coords) return null;
+      const { latitude, longitude } = position.coords;
+      const results = await LocationModule.reverseGeocodeAsync({ latitude, longitude }).catch(() => []);
+      const place = placeFromGeocode(results?.[0], latitude, longitude);
+      locationRef.current = place;
+      setLocationInfo(place);
+      return place;
+    } catch (error) {
+      console.warn('[IK TECH AI] Location error:', error);
+      return null;
+    }
+  }, []);
+
+  const handleToggleLocation = async () => {
+    if (locationEnabled) {
+      setLocationEnabled(false);
+      locationRef.current = null;
+      setLocationInfo(null);
+      return;
+    }
+    if (Platform.OS !== 'web' && !LocationModule) {
+      Alert.alert('Location unavailable', 'Install the location package first:\nnpx expo install expo-location');
+      return;
+    }
+    const place = await refreshLocation(true);
+    if (!place) {
+      Alert.alert(
+        appLanguage === 'Hausa' ? 'Ba a iya samun location ba' : 'Location is blocked',
+        appLanguage === 'Hausa' ? 'Ka ba IK TECH AI izinin location a saitunan wayarka, sannan ka sake kunnawa.' : 'Allow location for IK TECH AI in your phone settings, then turn this on again.',
+        [
+          { text: uiText.cancel, style: 'cancel' },
+          { text: 'Open settings', onPress: () => { Linking.openSettings().catch(() => {}); } },
+        ],
+      );
+      return;
+    }
+    setLocationEnabled(true);
+  };
+
+  useEffect(() => {
+    if (!settingsLoaded || !locationEnabled) return undefined;
+    void refreshLocation(false);
+    const sub = AppState.addEventListener('change', (state) => { if (state === 'active') void refreshLocation(false); });
+    return () => { sub.remove(); };
+  }, [settingsLoaded, locationEnabled, refreshLocation]);
+
   const toggleNotifCategory = (key: string) => setNotifPrefs((current) => ({ ...current, [key]: current[key] === false }));
 
   const sendTestNotification = async () => {
@@ -4646,7 +5308,74 @@ const handleForgotPassword = useCallback(async () => {
     return () => clearTimeout(timer);
   }, [history, libraryImages, libraryFiles, notificationsEnabled, notifPrefs.usage, notify]);
 
-          if (authLoading) {
+          const handleGoogleSignIn = async () => {
+            if (authBusy) return;
+            setAuthError(null);
+            setAuthNotice(null);
+            setAuthBusy(true);
+            try {
+              if (Platform.OS === 'web') {
+                await signInWithPopup(auth, new GoogleAuthProvider());
+              } else {
+                const GoogleSignin = GoogleSigninModule?.GoogleSignin;
+                if (!GoogleSignin || !GOOGLE_WEB_CLIENT_ID) {
+                  setAuthError('Google sign-in is not set up yet. Please continue with email for now.');
+                  return;
+                }
+                GoogleSignin.configure({ webClientId: GOOGLE_WEB_CLIENT_ID });
+                await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+                const result: any = await GoogleSignin.signIn();
+                const idToken = result?.data?.idToken ?? result?.idToken;
+                if (!idToken) return;
+                await signInWithCredential(auth, GoogleAuthProvider.credential(idToken));
+              }
+            } catch (error: any) {
+              const code = String(error?.code || '');
+              if (code === 'SIGN_IN_CANCELLED' || code === '12501' || code === '-5' || code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
+              setAuthError(error?.message || 'Google sign-in failed. Please try again.');
+            } finally {
+              setAuthBusy(false);
+            }
+          };
+
+          const handleAppleSignIn = async () => {
+            if (authBusy) return;
+            setAuthError(null);
+            setAuthNotice(null);
+            if (Platform.OS === 'android') {
+              setAuthNotice('Apple sign-in is for iPhone and iPad. Please use Google or email.');
+              return;
+            }
+            setAuthBusy(true);
+            try {
+              if (Platform.OS === 'web') {
+                const provider = new OAuthProvider('apple.com');
+                provider.addScope('email');
+                provider.addScope('name');
+                await signInWithPopup(auth, provider);
+              } else {
+                const Apple = AppleAuthModule;
+                if (!Apple || !(await Apple.isAvailableAsync())) {
+                  setAuthError('Apple sign-in is not set up yet. Please continue with email for now.');
+                  return;
+                }
+                const credential = await Apple.signInAsync({
+                  requestedScopes: [Apple.AppleAuthenticationScope.FULL_NAME, Apple.AppleAuthenticationScope.EMAIL],
+                });
+                if (!credential?.identityToken) throw new Error('Apple did not return an identity token.');
+                const provider = new OAuthProvider('apple.com');
+                await signInWithCredential(auth, provider.credential({ idToken: credential.identityToken }));
+              }
+            } catch (error: any) {
+              const code = String(error?.code || '');
+              if (code === 'ERR_REQUEST_CANCELED' || code === 'ERR_CANCELED' || code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
+              setAuthError(error?.message || 'Apple sign-in failed. Please try again.');
+            } finally {
+              setAuthBusy(false);
+            }
+          };
+
+          if (authLoading || (!iconFontsLoaded && !iconFontsError)) {
 
           return (
           <SafeAreaView style={styles.safeArea}>
@@ -5013,13 +5742,16 @@ const handleForgotPassword = useCallback(async () => {
             <View style={styles.profileTopSpacer} />
           </View>
           <ScrollView contentContainerStyle={{ paddingHorizontal: 18, paddingTop: 12, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
-            {row('apps-outline', 'Model', 'Standard', 'model')}
+            {row('apps-outline', 'Model', VOICE_MODELS.find((item) => item.key === voiceModel)?.label || 'Standard', 'model')}
             {voiceOpenSection === 'model' ? (
               <View style={menuStyle}>
-                {[{ label: 'Live', note: 'Coming soon' }, { label: 'Advanced', note: 'Coming soon' }, { label: 'Standard', note: '' }].map((item) => (
-                  <Pressable key={item.label} onPress={() => { if (!item.note) setVoiceOpenSection(null); }} style={[optStyle, item.note ? { opacity: 0.45 } : null]}>
-                    <Text style={{ color: primaryText, fontSize: 16, flex: 1, fontWeight: item.note ? '500' : '800' }}>{item.label}</Text>
-                    {item.note ? <Text style={{ color: secondaryText, fontSize: 12 }}>{item.note}</Text> : check}
+                {VOICE_MODELS.map((item) => (
+                  <Pressable key={item.key} onPress={() => { setVoiceModel(item.key); setVoiceOpenSection(null); }} style={optStyle}>
+                    <View style={{ flex: 1, paddingVertical: 6 }}>
+                      <Text style={{ color: primaryText, fontSize: 16, fontWeight: voiceModel === item.key ? '800' : '500' }}>{item.label}</Text>
+                      <Text style={{ color: secondaryText, fontSize: 12, marginTop: 2 }}>{item.desc}</Text>
+                    </View>
+                    {voiceModel === item.key ? check : null}
                   </Pressable>
                 ))}
               </View>
@@ -5166,6 +5898,7 @@ const handleForgotPassword = useCallback(async () => {
               </View>
             ) : null}
 
+            {settingsRow('location-outline', appLanguage === 'Hausa' ? 'Wuri (Location)' : 'Location', valueText(locationEnabled && locationInfo ? (locationInfo.city || locationInfo.state || uiText.on) : locationEnabled ? uiText.on : uiText.off), handleToggleLocation, 'forward')}
             {settingsRow('notifications-outline', uiText.notifications, valueText(notificationsEnabled && notifPermission === 'granted' ? uiText.on : uiText.off), () => { setSettingsVisible(false); setNotificationsVisible(true); }, 'forward')}
             {settingsRow('server-outline', uiText.storage, valueText(''), () => { setStorageDetail(null); setStorageVisible(true); }, 'forward')}
             {settingsRow('lock-closed-outline', uiText.security, valueText(uiText.changePassword), () => { setSettingsVisible(false); setSecurityVisible(true); }, 'forward')}
@@ -5323,11 +6056,64 @@ const handleForgotPassword = useCallback(async () => {
             </Text>
 
             <Text style={styles.authSubtitle}>
-              {authMode === 'login'
+              {authView === 'choose' ? 'Create your account' : authMode === 'login'
                 ? 'Login to continue'
                 : 'Create your account'}
             </Text>
 
+            {authView === 'choose' ? (
+              <View style={{ width: '100%', maxWidth: 430, alignItems: 'center' }}>
+                <Pressable
+                  onPress={() => { setAuthMode('login'); setAuthView('email'); setAuthError(null); setAuthNotice(null); }}
+                  style={{ marginBottom: 22, paddingVertical: 4 }}
+                >
+                  <Text style={styles.authSwitchText}>
+                    Already have an account? <Text style={{ color: '#60A5FA', fontWeight: '800' }}>Login</Text>
+                  </Text>
+                </Pressable>
+
+                {authError ? <Text style={styles.authError}>{authError}</Text> : null}
+                {authNotice ? <Text style={styles.authNotice}>{authNotice}</Text> : null}
+
+                <Pressable
+                  onPress={handleGoogleSignIn}
+                  disabled={authBusy}
+                  accessibilityLabel="Continue with Google"
+                  style={[{ minHeight: 54, borderRadius: 27, borderWidth: 1, borderColor: '#2a3a52', backgroundColor: '#0f1b2d', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 18, marginBottom: 12, width: '100%', maxWidth: 430 }, authBusy ? { opacity: 0.6 } : null]}
+                >
+                  <Ionicons name="logo-google" size={20} color="#ffffff" style={{ position: 'absolute', left: 20 }} />
+                  {authBusy ? <ActivityIndicator color="#ffffff" /> : <Text style={{ color: '#ffffff', fontSize: 16, fontWeight: '700' }}>Continue with Google</Text>}
+                </Pressable>
+
+                <Pressable
+                  onPress={() => { setAuthMode('signup'); setAuthView('email'); setAuthError(null); setAuthNotice(null); }}
+                  accessibilityLabel="Continue with email"
+                  style={{ minHeight: 54, borderRadius: 27, borderWidth: 1, borderColor: '#2a3a52', backgroundColor: '#0f1b2d', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 18, marginBottom: 12, width: '100%', maxWidth: 430 }}
+                >
+                  <Ionicons name="mail-outline" size={21} color="#ffffff" style={{ position: 'absolute', left: 20 }} />
+                  <Text style={{ color: '#ffffff', fontSize: 16, fontWeight: '700' }}>Continue with email</Text>
+                </Pressable>
+
+                <Pressable
+                  onPress={handleAppleSignIn}
+                  disabled={authBusy}
+                  accessibilityLabel="Continue with Apple"
+                  style={[{ minHeight: 54, borderRadius: 27, borderWidth: 1, borderColor: '#2a3a52', backgroundColor: '#0f1b2d', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 18, marginBottom: 12, width: '100%', maxWidth: 430 }, authBusy ? { opacity: 0.6 } : null]}
+                >
+                  <Ionicons name="logo-apple" size={22} color="#ffffff" style={{ position: 'absolute', left: 20 }} />
+                  <Text style={{ color: '#ffffff', fontSize: 16, fontWeight: '700' }}>Continue with Apple</Text>
+                </Pressable>
+              </View>
+            ) : (
+            <>
+            <Pressable
+              onPress={() => { setAuthView('choose'); setAuthError(null); setAuthNotice(null); }}
+              hitSlop={10}
+              style={{ alignSelf: 'flex-start', flexDirection: 'row', alignItems: 'center', marginBottom: 14 }}
+            >
+              <Ionicons name="arrow-back" size={20} color="#60A5FA" />
+              <Text style={{ color: '#60A5FA', fontSize: 14, fontWeight: '700', marginLeft: 6 }}>Back</Text>
+            </Pressable>
             <TextInput
               value={authEmail}
               onChangeText={setAuthEmail}
@@ -5416,6 +6202,8 @@ const handleForgotPassword = useCallback(async () => {
                   : 'Already have an account? Login'}
               </Text>
             </Pressable>
+            </>
+            )}
           </View>
         </SafeAreaView>
       );
@@ -5520,6 +6308,9 @@ const handleForgotPassword = useCallback(async () => {
                                 onShare={handleShareMessage}
                                 onMore={(message) => setMoreMenuMessage(message)}
                                 onOpenAttachment={openAttachment}
+                                onSaveFile={saveSplitFile}
+                                onSaveAllFiles={saveSplitFiles}
+                                textColor={primaryText}
                               />
                             )}
                             ListEmptyComponent={
@@ -5560,27 +6351,28 @@ const handleForgotPassword = useCallback(async () => {
                           />
                         </View>
 
-                        {errorMessage && /limit|quota|too many requests|\b429\b|exceeded|upgrade/i.test(errorMessage) ? (
-                          <View style={{ marginHorizontal: 16, marginBottom: 10, padding: 14, borderRadius: 18, borderWidth: 1, backgroundColor: isLightTheme ? '#fff7e6' : '#2a2112', borderColor: isLightTheme ? '#f0d49a' : '#5c4a1d' }}>
-                            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                              <Ionicons name="alert-circle" size={26} color={isLightTheme ? '#b7791f' : '#f6c453'} style={{ marginRight: 10 }} />
-                              <View style={{ flex: 1, marginRight: 10 }}>
-                                <Text style={{ color: primaryText, fontSize: 15, fontWeight: '800' }}>You reached your limit</Text>
-                                <Text style={{ color: secondaryText, fontSize: 13, lineHeight: 19, marginTop: 3 }}>
-                                  Free messages are used up for now. Upgrade to keep chatting without waiting, or try again when your limit resets.
-                                </Text>
-                              </View>
-                              <Pressable onPress={() => setErrorMessage(null)} hitSlop={10} accessibilityLabel="Close" style={{ alignSelf: 'flex-start' }}>
-                                <Ionicons name="close" size={20} color={secondaryText} />
-                              </Pressable>
+                        {errorMessage && LIMIT_MESSAGE_REGEX.test(errorMessage) ? (
+                          <View style={{ marginHorizontal: 16, marginBottom: 12, paddingHorizontal: 20, paddingTop: 22, paddingBottom: 16, borderRadius: 28, borderWidth: 1, alignItems: 'center', backgroundColor: isLightTheme ? '#f5f3ff' : '#17162b', borderColor: isLightTheme ? '#ddd6fe' : '#38336a' }}>
+                            <Pressable onPress={() => setErrorMessage(null)} hitSlop={12} accessibilityLabel="Close" style={{ position: 'absolute', top: 12, right: 12, width: 30, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center', backgroundColor: isLightTheme ? '#ede9fe' : '#262350' }}>
+                              <Ionicons name="close" size={18} color={secondaryText} />
+                            </Pressable>
+                            <View style={{ width: 58, height: 58, borderRadius: 29, alignItems: 'center', justifyContent: 'center', backgroundColor: accentColor, marginBottom: 12 }}>
+                              <Ionicons name="flash" size={28} color="#ffffff" />
                             </View>
+                            <Text style={{ color: primaryText, fontSize: 18, fontWeight: '800', textAlign: 'center' }}>Daily limit reached</Text>
+                            <Text style={{ color: secondaryText, fontSize: 14, lineHeight: 21, marginTop: 6, textAlign: 'center' }}>
+                              You have used all your free questions for today. Upgrade to keep chatting right now, or come back tomorrow.
+                            </Text>
                             <Pressable
                               onPress={() => { setErrorMessage(null); setPremiumVisible(true); }}
                               accessibilityLabel="Upgrade to continue"
-                              style={{ marginTop: 12, minHeight: 46, borderRadius: 14, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', backgroundColor: accentColor }}
+                              style={{ marginTop: 16, alignSelf: 'stretch', minHeight: 50, borderRadius: 25, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', backgroundColor: accentColor }}
                             >
-                              <Ionicons name="rocket-outline" size={18} color="#ffffff" style={{ marginRight: 8 }} />
-                              <Text style={{ color: '#ffffff', fontSize: 15, fontWeight: '800' }}>Upgrade to continue</Text>
+                              <Ionicons name="rocket-outline" size={19} color="#ffffff" style={{ marginRight: 8 }} />
+                              <Text style={{ color: '#ffffff', fontSize: 16, fontWeight: '800' }}>Upgrade to continue</Text>
+                            </Pressable>
+                            <Pressable onPress={() => setErrorMessage(null)} hitSlop={8} style={{ marginTop: 12, paddingVertical: 6 }}>
+                              <Text style={{ color: secondaryText, fontSize: 14, fontWeight: '700' }}>Maybe later</Text>
                             </Pressable>
                           </View>
                         ) : errorMessage ? (
@@ -5611,51 +6403,32 @@ const handleForgotPassword = useCallback(async () => {
                           </View>
                         ) : null}
 
-                        {selectedDocument ? (
-                          <View style={[{ flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', maxWidth: '92%', marginHorizontal: 16, marginBottom: 8, paddingVertical: 9, paddingLeft: 12, paddingRight: 6, borderRadius: 14, backgroundColor: isLightTheme ? '#e9edf3' : '#112238' }, isLargeScreen && styles.largeWidthBox]}>
-                            <Pressable onPress={() => openAttachment(selectedDocument)} accessibilityLabel="Open attached file" style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
-                              <Ionicons name={selectedDocument.mimeType.startsWith('video') ? 'videocam-outline' : selectedDocument.mimeType.startsWith('audio') ? 'musical-notes-outline' : 'document-text-outline'} size={22} color={accentColor} style={{ marginRight: 10 }} />
-                              <Text style={{ color: primaryText, fontSize: 14, fontWeight: '600', flexShrink: 1 }} numberOfLines={1}>{selectedDocument.name}</Text>
+                        {attachedDocuments.map((doc, index) => (
+                          <View key={`attached-doc-${index}-${doc.name}`} style={[{ flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', maxWidth: '92%', marginHorizontal: 16, marginBottom: 8, paddingVertical: 9, paddingLeft: 12, paddingRight: 6, borderRadius: 14, backgroundColor: isLightTheme ? '#e9edf3' : '#112238' }, isLargeScreen && styles.largeWidthBox]}>
+                            <Pressable onPress={() => openAttachment(doc)} accessibilityLabel="Open attached file" style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
+                              <Ionicons name={doc.mimeType.startsWith('video') ? 'videocam-outline' : doc.mimeType.startsWith('audio') ? 'musical-notes-outline' : 'document-text-outline'} size={22} color={accentColor} style={{ marginRight: 10 }} />
+                              <Text style={{ color: primaryText, fontSize: 14, fontWeight: '600', flexShrink: 1 }} numberOfLines={1}>{doc.name}</Text>
                             </Pressable>
-                            <Pressable onPress={() => setSelectedDocument(null)} hitSlop={8} style={{ paddingHorizontal: 10, paddingVertical: 4 }} accessibilityLabel="Remove attached file">
+                            <Pressable onPress={() => removeDocumentAt(index)} hitSlop={8} style={{ paddingHorizontal: 10, paddingVertical: 4 }} accessibilityLabel="Remove attached file">
                               <Ionicons name="close" size={18} color={secondaryText} />
                             </Pressable>
                           </View>
-                        ) : null}
+                        ))}
 
-                        {selectedImage ? (
-                        <View
-                        style={[
-                        styles.selectedImageContainer,
-                        isLargeScreen &&
-                        styles.largeWidthBox,
-                        ]}
-                        >  
-
-                            <Pressable onPress={() => setImageViewerUri(selectedImage.uri)} accessibilityRole="button" accessibilityLabel="Preview attached image">
-                              <Image
-                                source={{ uri: selectedImage.uri }}
-                                style={styles.selectedImage}
-                                resizeMode="contain"
-                              />
-                            </Pressable>
-
-                            <Pressable
-                              onPress={
-                                handleRemoveSelectedImage
-                              }
-                              style={
-                                styles.removeImageButton
-                              }
-                            >
-                              <Text
-                                style={
-                                  styles.removeImageText
-                                }
-                              >
-                                ×
-                              </Text>
-                            </Pressable>
+                        {attachedImages.length ? (
+                          <View style={[styles.selectedImageContainer, isLargeScreen && styles.largeWidthBox]}>
+                            <ScrollView horizontal showsHorizontalScrollIndicator={false} keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingTop: 8, paddingRight: 12 }}>
+                              {attachedImages.map((image, index) => (
+                                <View key={`attached-image-${index}`} style={{ marginRight: 12, position: 'relative' }}>
+                                  <Pressable onPress={() => setImageViewerUri(image.uri)} accessibilityRole="button" accessibilityLabel="Preview attached image">
+                                    <Image source={{ uri: image.uri }} style={styles.selectedImage} resizeMode="contain" />
+                                  </Pressable>
+                                  <Pressable onPress={() => removeImageAt(index)} accessibilityLabel="Remove attached image" style={[styles.removeImageButton, { left: 64 }]}>
+                                    <Text style={styles.removeImageText}>×</Text>
+                                  </Pressable>
+                                </View>
+                              ))}
+                            </ScrollView>
                           </View>
                         ) : null}
 
@@ -5933,7 +6706,7 @@ const handleForgotPassword = useCallback(async () => {
                               ? 'Listening...'
                               : isSpeaking
                                 ? 'Speaking...'
-                                : 'Voice Mode'}
+                                : voiceModel === 'standard' ? 'Voice Mode' : voiceModel === 'live' ? 'Live' : 'Advanced'}
                           </Text>
 
                           <Text
@@ -5942,10 +6715,10 @@ const handleForgotPassword = useCallback(async () => {
                             }
                           >
                             {isListening
-                              ? 'Speak naturally'
+                              ? (voiceModel === 'advanced' && interimText ? interimText : 'Speak naturally')
                               : isSpeaking
                                 ? 'IK TECH AI is responding'
-                                : 'Tap the microphone and speak'}
+                                : voiceModel === 'standard' ? 'Tap the microphone and speak' : 'Hands-free: starting the microphone...'}
                           </Text>
 
                           {isSpeaking ? (
@@ -6168,66 +6941,52 @@ const handleForgotPassword = useCallback(async () => {
                               </Text>
                             </View>
                           }
-                          renderItem={({
-                            item,
-                          }) => (
-                            <View
-                              style={[
-                                styles.historyItem,
-                                item.id ===
-                                  activeChatId &&
-                                  styles.historyItemActive,
-                              ]}
-                            >
-                              <Pressable
-                                onPress={() =>
-                                  handleSelectConversation(
-                                    item,
-                                  )
-                                }
-                                style={
-                                  styles.historyItemMain
-                                }
-                              >
-                                <Text
-                                  numberOfLines={1}
-                                  style={
-                                    styles.historyItemTitle
-                                  }
+                          renderItem={({ item }) => {
+                            const meta = chatMeta[item.id] || {};
+                            const linkedProject = meta.projectId ? libraryProjects.find((entry) => entry.id === meta.projectId) : undefined;
+                            const hiddenPreview = !!meta.locked && !unlockedChatIds.includes(item.id);
+                            const lastText = hiddenPreview ? 'Locked chat' : (item.messages?.[item.messages.length - 1]?.content || 'No messages');
+                            return (
+                              <View style={[styles.historyItem, item.id === activeChatId && styles.historyItemActive]}>
+                                <Pressable
+                                  onPress={() => handleOpenChat(item)}
+                                  onLongPress={(event: any) => openChatMenu(item, event?.nativeEvent?.pageY)}
+                                  delayLongPress={350}
+                                  style={styles.historyItemMain}
                                 >
-                                  {item.title ||
-                                    'New Chat'}
-                                </Text>
+                                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                                    {meta.pinned ? <Ionicons name="pin" size={13} color={tc('#9bcaff')} style={{ marginRight: 6 }} /> : null}
+                                    {meta.locked ? <Ionicons name="lock-closed" size={13} color={tc('#9bcaff')} style={{ marginRight: 6 }} /> : null}
+                                    <Text numberOfLines={1} style={[styles.historyItemTitle, { flexShrink: 1 }]}>{item.title || 'New Chat'}</Text>
+                                  </View>
+                                  <Text numberOfLines={1} style={styles.historyItemPreview}>{lastText}</Text>
+                                  {linkedProject ? (
+                                    <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 3 }}>
+                                      <Ionicons name="folder-outline" size={12} color={tc('#9bcaff')} style={{ marginRight: 4 }} />
+                                      <Text numberOfLines={1} style={[styles.historyItemPreview, { fontSize: 12 }]}>{linkedProject.name}</Text>
+                                    </View>
+                                  ) : null}
+                                </Pressable>
 
-                                <Text
-                                  numberOfLines={1}
-                                  style={
-                                    styles.historyItemPreview
-                                  }
+                                <Pressable
+                                  onPress={(event: any) => openChatMenu(item, event?.nativeEvent?.pageY)}
+                                  hitSlop={8}
+                                  accessibilityLabel="Chat options"
+                                  style={styles.deleteHistoryButton}
                                 >
-                                  {item.messages?.[
-                                    item.messages.length -
-                                      1
-                                  ]?.content ||
-                                    'No messages'}
-                                </Text>
-                              </Pressable>
-
-                              <Pressable
-                                onPress={() =>
-                                  handleDeleteConversation(
-                                    item.id,
-                                  )
-                                }
-                                style={
-                                  styles.deleteHistoryButton
-                                }
-                              >
-                                <Ionicons name="trash-outline" size={18} color={tc('#9bcaff')} />
-                              </Pressable>
-                            </View>
-                          )}
+                                  <Ionicons name="ellipsis-vertical" size={18} color={tc('#9bcaff')} />
+                                </Pressable>
+                              </View>
+                            );
+                          }}
                         />
+
+                        {(archivedCount > 0 || showArchived) ? (
+                          <Pressable onPress={() => setShowArchived((value) => !value)} style={{ flexDirection: 'row', alignItems: 'center', alignSelf: 'center', paddingVertical: 8, paddingHorizontal: 14 }}>
+                            <Ionicons name={showArchived ? 'chatbubbles-outline' : 'archive-outline'} size={16} color={tc('#9bcaff')} style={{ marginRight: 6 }} />
+                            <Text style={{ color: tc('#9bcaff'), fontSize: 14, fontWeight: '700' }}>{showArchived ? 'Back to chats' : `Archived chats (${archivedCount})`}</Text>
+                          </Pressable>
+                        ) : null}
 
                         <View style={styles.historyBottomBar}>
                           <Pressable
@@ -6279,6 +7038,112 @@ const handleForgotPassword = useCallback(async () => {
                           </Pressable>
                         </View>
                       </View>
+                    {chatDialog ? (
+                      <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 100 }}>
+                        <Pressable onPress={closeChatDialog} style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.45)' }} />
+
+                        {chatDialog.type === 'menu' ? (
+                          <View style={{ position: 'absolute', right: 18, width: 250, top: Math.max(70, Math.min((chatDialog.y || 200) - 70, windowHeight - 420)), borderRadius: 26, paddingVertical: 8, backgroundColor: isLightTheme ? '#ffffff' : '#1b2b44', borderWidth: 1, borderColor: hairline, elevation: 12, shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 16, shadowOffset: { width: 0, height: 6 } }}>
+                            {getChatMenuRows(chatDialog.item).map((row) => (
+                              <Pressable key={row.key} onPress={row.run} style={{ minHeight: 52, paddingHorizontal: 18, flexDirection: 'row', alignItems: 'center' }}>
+                                <Ionicons name={row.icon as any} size={22} color={row.danger ? '#e11d48' : primaryText} style={{ marginRight: 16 }} />
+                                <Text style={{ color: row.danger ? '#e11d48' : primaryText, fontSize: 17, fontWeight: row.danger ? '700' : '600', flex: 1 }}>{row.label}</Text>
+                                {row.chevron ? <Ionicons name="chevron-forward" size={18} color={secondaryText} /> : null}
+                              </Pressable>
+                            ))}
+                          </View>
+                        ) : null}
+
+                        {chatDialog.type === 'rename' ? (
+                          <View style={{ position: 'absolute', left: 22, right: 22, top: 110, borderRadius: 24, padding: 20, backgroundColor: isLightTheme ? '#ffffff' : '#1b2b44', borderWidth: 1, borderColor: hairline }}>
+                            <Text style={{ color: primaryText, fontSize: 18, fontWeight: '800', marginBottom: 12 }}>Rename chat</Text>
+                            <TextInput
+                              value={renameText}
+                              onChangeText={setRenameText}
+                              autoFocus
+                              maxLength={80}
+                              placeholder="Chat name"
+                              placeholderTextColor={secondaryText}
+                              returnKeyType="done"
+                              onSubmitEditing={handleRenameSubmit}
+                              style={{ minHeight: 48, borderRadius: 16, borderWidth: 1, borderColor: hairline, paddingHorizontal: 14, color: primaryText, fontSize: 16 }}
+                            />
+                            <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 16 }}>
+                              <Pressable onPress={closeChatDialog} style={{ paddingVertical: 10, paddingHorizontal: 16 }}>
+                                <Text style={{ color: secondaryText, fontSize: 16, fontWeight: '700' }}>Cancel</Text>
+                              </Pressable>
+                              <Pressable onPress={handleRenameSubmit} style={{ paddingVertical: 10, paddingHorizontal: 22, borderRadius: 20, backgroundColor: accentColor, marginLeft: 8 }}>
+                                <Text style={{ color: '#ffffff', fontSize: 16, fontWeight: '800' }}>Save</Text>
+                              </Pressable>
+                            </View>
+                          </View>
+                        ) : null}
+
+                        {chatDialog.type === 'project' ? (
+                          <View style={{ position: 'absolute', left: 22, right: 22, top: 110, maxHeight: windowHeight - 260, borderRadius: 24, padding: 20, backgroundColor: isLightTheme ? '#ffffff' : '#1b2b44', borderWidth: 1, borderColor: hairline }}>
+                            <Text style={{ color: primaryText, fontSize: 18, fontWeight: '800', marginBottom: 12 }}>Add to project</Text>
+                            {libraryProjects.length === 0 ? (
+                              <View>
+                                <Text style={{ color: secondaryText, fontSize: 15, lineHeight: 22 }}>You have no projects yet. Create one first, then come back to add this chat to it.</Text>
+                                <Pressable onPress={() => { closeChatDialog(); setHistoryVisible(false); setProjectVisible(true); }} style={{ marginTop: 14, minHeight: 46, borderRadius: 23, alignItems: 'center', justifyContent: 'center', backgroundColor: accentColor }}>
+                                  <Text style={{ color: '#ffffff', fontSize: 15, fontWeight: '800' }}>Create a project</Text>
+                                </Pressable>
+                              </View>
+                            ) : (
+                              <ScrollView style={{ maxHeight: windowHeight - 400 }} keyboardShouldPersistTaps="handled">
+                                {libraryProjects.map((project) => {
+                                  const selected = chatMeta[chatDialog.item.id]?.projectId === project.id;
+                                  return (
+                                    <Pressable key={project.id} onPress={() => { updateChatMeta(chatDialog.item.id, { projectId: project.id }); closeChatDialog(); }} style={{ minHeight: 50, flexDirection: 'row', alignItems: 'center', borderTopWidth: 1, borderTopColor: hairline }}>
+                                      <Ionicons name="folder-outline" size={20} color={primaryText} style={{ marginRight: 12 }} />
+                                      <Text numberOfLines={1} style={{ color: primaryText, fontSize: 16, fontWeight: selected ? '800' : '500', flex: 1 }}>{project.name}</Text>
+                                      {selected ? <Ionicons name="checkmark" size={21} color={accentColor} /> : null}
+                                    </Pressable>
+                                  );
+                                })}
+                              </ScrollView>
+                            )}
+                            {chatMeta[chatDialog.item.id]?.projectId ? (
+                              <Pressable onPress={() => { updateChatMeta(chatDialog.item.id, { projectId: '' }); closeChatDialog(); }} style={{ marginTop: 10, paddingVertical: 10 }}>
+                                <Text style={{ color: '#e11d48', fontSize: 15, fontWeight: '700' }}>Remove from project</Text>
+                              </Pressable>
+                            ) : null}
+                          </View>
+                        ) : null}
+
+                        {chatDialog.type === 'pin' ? (
+                          <View style={{ position: 'absolute', left: 22, right: 22, top: 110, borderRadius: 24, padding: 20, backgroundColor: isLightTheme ? '#ffffff' : '#1b2b44', borderWidth: 1, borderColor: hairline }}>
+                            <Text style={{ color: primaryText, fontSize: 18, fontWeight: '800' }}>
+                              {chatDialog.pinMode === 'create' ? 'Set a PIN to lock chats' : chatDialog.pinMode === 'unlock' ? 'This chat is locked' : 'Unlock this chat'}
+                            </Text>
+                            <Text style={{ color: secondaryText, fontSize: 14, lineHeight: 20, marginTop: 6, marginBottom: 12 }}>
+                              {chatDialog.pinMode === 'create' ? 'Choose a 4-digit PIN. You will use it to open your locked chats.' : 'Enter your 4-digit PIN.'}
+                            </Text>
+                            <TextInput
+                              value={pinInput}
+                              onChangeText={(text) => { setPinInput(text.replace(/\D/g, '').slice(0, 4)); setPinError(''); }}
+                              autoFocus
+                              secureTextEntry
+                              keyboardType="number-pad"
+                              maxLength={4}
+                              placeholder="••••"
+                              placeholderTextColor={secondaryText}
+                              onSubmitEditing={submitChatPin}
+                              style={{ minHeight: 52, borderRadius: 16, borderWidth: 1, borderColor: hairline, paddingHorizontal: 14, color: primaryText, fontSize: 22, letterSpacing: 8, textAlign: 'center' }}
+                            />
+                            {pinError ? <Text style={{ color: '#e11d48', fontSize: 13, marginTop: 8 }}>{pinError}</Text> : null}
+                            <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 16 }}>
+                              <Pressable onPress={closeChatDialog} style={{ paddingVertical: 10, paddingHorizontal: 16 }}>
+                                <Text style={{ color: secondaryText, fontSize: 16, fontWeight: '700' }}>Cancel</Text>
+                              </Pressable>
+                              <Pressable onPress={submitChatPin} style={{ paddingVertical: 10, paddingHorizontal: 22, borderRadius: 20, backgroundColor: accentColor, marginLeft: 8 }}>
+                                <Text style={{ color: '#ffffff', fontSize: 16, fontWeight: '800' }}>{chatDialog.pinMode === 'create' ? 'Set PIN' : 'Confirm'}</Text>
+                              </Pressable>
+                            </View>
+                          </View>
+                        ) : null}
+                      </View>
+                    ) : null}
                     </SafeAreaView>
                     </View>
                     </Modal>
@@ -7267,7 +8132,6 @@ const handleForgotPassword = useCallback(async () => {
         paddingBottom: 20,
         width: '100%',
         },
-
         emptyChatContent: {
         flexGrow: 1,
         justifyContent: 'center',
@@ -8426,3 +9290,6 @@ const handleForgotPassword = useCallback(async () => {
         </>
         );
         }
+
+
+
