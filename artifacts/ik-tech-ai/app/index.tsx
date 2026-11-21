@@ -64,6 +64,8 @@ import {
   OAuthProvider,
   signInWithCredential,
   signInWithPopup,
+signInWithRedirect,
+getRedirectResult,
   updatePassword,
   sendPasswordResetEmail,
   onAuthStateChanged,
@@ -2357,6 +2359,24 @@ uiLightMode = isLightTheme;
 
       return unsubscribe;
     }, []);
+
+
+useEffect(() => {
+  let active = true;
+
+  getRedirectResult(auth)
+    .catch((error: any) => {
+      if (!active) return;
+      console.error('Google redirect sign-in error:', error);
+      setAuthError(error?.message || 'Google sign-in failed. Please try again.');
+    });
+
+  return () => {
+    active = false;
+  };
+}, []);
+
+  
     useEffect(() => {
       const loadProfile = async () => {
         if (!user) {
@@ -5315,13 +5335,13 @@ const handleForgotPassword = useCallback(async () => {
             setAuthBusy(true);
             try {
               if (Platform.OS === 'web') {
-                await signInWithPopup(auth, new GoogleAuthProvider());
-              } else {
-                const GoogleSignin = GoogleSigninModule?.GoogleSignin;
-                if (!GoogleSignin || !GOOGLE_WEB_CLIENT_ID) {
-                  setAuthError('Google sign-in is not set up yet. Please continue with email for now.');
-                  return;
-                }
+  await signInWithRedirect(auth, new GoogleAuthProvider());
+} else {
+  const GoogleSignin = GoogleSigninModule?.GoogleSignin;
+  if (!GoogleSignin || !GOOGLE_WEB_CLIENT_ID) {
+    setAuthError('Google sign-in is not set up yet. Please continue with email for now.');
+    return;
+  }
                 GoogleSignin.configure({ webClientId: GOOGLE_WEB_CLIENT_ID });
                 await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
                 const result: any = await GoogleSignin.signIn();
