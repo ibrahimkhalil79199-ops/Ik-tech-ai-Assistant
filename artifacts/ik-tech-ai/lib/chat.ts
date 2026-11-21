@@ -16,6 +16,8 @@ export interface ChatAttachment {
   mimeType: string;
   // For text and code files: the text inside the file. It is sent to the AI but not shown in the chat.
   text?: string;
+  // Web only: key of the copy of the file kept in the browser, so it can still be opened after a reload.
+  fileKey?: string;
 }
 
 export interface ChatMessage {
@@ -24,6 +26,11 @@ export interface ChatMessage {
   content: string;
   image?: ChatImage;
   attachment?: ChatAttachment;
+  // More pictures / files sent together with the first one in the same message.
+  extraImages?: ChatImage[];
+  extraAttachments?: ChatAttachment[];
+  // Parts made when the user asks the app to split a file.
+  splitFiles?: any[];
 }
 
 export interface ChatConversation {
@@ -35,6 +42,13 @@ export interface ChatConversation {
 }
 
 const STORAGE_KEY = 'ik-tech-ai:history:v1';
+
+// The app sends extra pictures/files as small turns that start with this text (see index.tsx).
+const EXTRA_ITEM_MARK = 'Attached item ';
+// Everything sent in one request (base64 text) must stay below this size, or the AI refuses it.
+const MAX_MEDIA_CHARS = 19_000_000;
+// How long to wait for the AI to start answering.
+const RESPONSE_TIMEOUT_MS = 90_000;
 
 let messageCounter = 0;
 
@@ -275,11 +289,44 @@ export async function streamChat(
     ? await imageUriToDataUrl(lastUserMessage.image)
     : undefined;
 
-  // Only the newest message's file is sent, so old chats do not become heavy.
+  // The newest message's file is sent as a file. Old chats are not sent again, so they stay light.
   const attachment =
     lastUserMessage.attachment && !lastUserMessage.attachment.text
       ? await attachmentToPayload(lastUserMessage.attachment)
       : undefined;
+
+  // Extra pictures / files the user sent together with the newest message (they are separate small turns).
+  const extraItems = messages.filter(
+    (item) =>
+      item !== lastUserMessage &&
+      item.role === 'user' &&
+      item.content.startsWith(EXTRA_ITEM_MARK),
+  );
+
+  const extraImages: string[] = [];
+  const extraAttachments: { name: string; mimeType: string; data: string }[] = [];
+
+  for (const item of extraItems) {
+    if (item.image) {
+      extraImages.push(await imageUriToDataUrl(item.image));
+    }
+
+    if (item.attachment && !item.attachment.text) {
+      extraAttachments.push(await attachmentToPayload(item.attachment));
+    }
+  }
+
+  const totalMediaChars =
+    (image?.length || 0) +
+    (attachment?.data.length || 0) +
+    extraImages.reduce((sum, value) => sum + value.length, 0) +
+    extraAttachments.reduce((sum, value) => sum + value.data.length, 0);
+
+  if (totalMediaChars > MAX_MEDIA_CHARS) {
+    throw new Error(
+      'These files are too big to send together. Please send fewer or smaller files (video and audio under about 8 MB in total).',
+    );
+  }
 
   const currentUser = auth.currentUser;
 
@@ -290,23 +337,47 @@ export async function streamChat(
   // The Worker uses this token to know who is asking (for daily limits).
   const idToken = await currentUser.getIdToken();
 
-  const response = await fetch(getApiUrl(), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${idToken}`,
-    },
-    body: JSON.stringify({
-      message:
-        message ||
-        (attachment
-          ? 'Please read the attached file and tell me what is in it, in the language I use.'
-          : 'Please examine the attached image and respond in the language I use.'),
-      messages: conversationMessages,
-      image,
-      attachment,
-    }),
-  });
+  // Give up waiting if the AI does not start answering in time.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), RESPONSE_TIMEOUT_MS);
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+
+  try {
+    response = await fetch(getApiUrl(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        message:
+          message ||
+          (attachment
+            ? 'Please read the attached file and tell me what is in it, in the language I use.'
+            : 'Please examine the attached image and respond in the language I use.'),
+        messages: conversationMessages,
+        image,
+        attachment,
+        // More pictures / files sent together with `image` / `attachment` above.
+        ...(extraImages.length ? { images: extraImages } : {}),
+        ...(extraAttachments.length ? { attachments: extraAttachments } : {}),
+      }),
+    });
+  } catch (error) {
+    clearTimeout(timeoutId);
+
+    if ((error as { name?: string })?.name === 'AbortError') {
+      throw new Error(
+        'The AI took too long to respond (timeout). Please try again.',
+      );
+    }
+
+    throw error;
+  }
+
+  clearTimeout(timeoutId);
 
   console.log(
     '[IK TECH AI] Cloudflare status:',
@@ -316,7 +387,10 @@ export async function streamChat(
   // Error from the Worker (it sends errors as JSON)
   if (!response.ok) {
     const errorText = await response.text();
-    let errorMessage = 'The AI service could not respond.';
+    let errorMessage =
+      response.status >= 502 && response.status <= 504
+        ? 'The AI is busy right now. Please try again in a moment.'
+        : 'The AI service could not respond.';
 
     try {
       const parsedError = JSON.parse(errorText) as {
