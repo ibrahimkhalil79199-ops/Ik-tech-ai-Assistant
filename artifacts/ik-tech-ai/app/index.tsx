@@ -75,8 +75,11 @@ getRedirectResult,
 
 import firebaseApp, { auth, db } from '@/firebase';
 import {
+  collection,
+  deleteDoc,
   doc,
   getDoc,
+  getDocs,
   setDoc,
 } from 'firebase/firestore';
 
@@ -93,7 +96,10 @@ type SelectedImage = {
 };
 
 // A file waiting to be sent. `fullText` keeps the whole text of a text/code file (only used for splitting it into parts).
-type AttachedDoc = { uri: string; name: string; mimeType: string; text?: string; fullText?: string };
+type AttachedDoc = { uri: string; name: string; mimeType: string; text?: string; fullText?: string; fileKey?: string };
+// Text, pictures and files the user typed or picked but has not sent yet (kept when the app is closed).
+type DraftSnapshot = { text: string; images: SelectedImage[]; docs: AttachedDoc[]; at: number };
+const DRAFTS_KEY = 'ik-tech-ai:drafts:v1';
 // One part produced when the user asks the app to split a file.
 type SplitFile = { name: string; mimeType: string; size: number; text?: string; uri?: string };
 const MAX_ATTACHMENTS = 10;
@@ -198,7 +204,7 @@ const detectImageIntent = (text: string, hasImage: boolean): 'create' | 'edit' |
   if (lower.length < 6) return null;
   if (/^\/(image|imagine|draw)\b/.test(lower)) return hasImage ? 'edit' : 'create';
   if (hasImage) {
-    const editVerb = /\b(edit|change|replace|remove|erase|delete|add|make it|make the|make this|turn it|turn this|convert|enhance|brighten|brightness|darken|blur|sharpen|retouch|colorize|colourise|restore|cartoon|background|filter|crop|gyara|canza|cire|goge|ƙara|kara|haskaka)\b/;
+    const editVerb = /\b(edit|combine|merge|blend|mix|join|swap|haɗa|haxa|hade|hada|change|replace|remove|erase|delete|add|make it|make the|make this|turn it|turn this|convert|enhance|brighten|brightness|darken|blur|sharpen|retouch|colorize|colourise|restore|cartoon|background|filter|crop|gyara|canza|cire|goge|ƙara|kara|haskaka)\b/;
     const analysisWord = /\b(what|who|which|where|why|how|describe|explain|read|extract|text|translate|ocr|transcribe|copy|identify|tell me|menene|wane|wace|bayyana|fassara|rubutu|rubutun|karanta|fitomin|fito min)\b/;
     return editVerb.test(lower) && !analysisWord.test(lower) ? 'edit' : null;
   }
@@ -228,15 +234,101 @@ const readImageAsDataUrl = async (uri: string, mimeType?: string): Promise<strin
   return `data:${mimeType || 'image/jpeg'};base64,${base64}`;
 };
 
+// ───────────────── Keeping attached files on the web (so they still open after the page is reloaded) ─────────────────
+const FILES_DB_NAME = 'ik-tech-ai-files';
+const FILES_DB_STORE = 'files';
+const openFilesDb = () => new Promise<any>((resolve, reject) => {
+  const idb = (globalThis as any).indexedDB;
+  if (!idb) { reject(new Error('Storage is not available.')); return; }
+  const request = idb.open(FILES_DB_NAME, 1);
+  request.onupgradeneeded = () => { request.result.createObjectStore(FILES_DB_STORE); };
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => reject(request.error);
+});
+const saveWebFileFromUri = async (uri: string, name: string): Promise<string | null> => {
+  try {
+    const blob = await (await fetch(uri)).blob();
+    const database = await openFilesDb();
+    const key = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${name}`;
+    await new Promise((resolve, reject) => {
+      const tx = database.transaction(FILES_DB_STORE, 'readwrite');
+      tx.objectStore(FILES_DB_STORE).put(blob, key);
+      tx.oncomplete = () => resolve(null);
+      tx.onerror = () => reject(tx.error);
+    });
+    return key;
+  } catch (_error) {
+    return null;
+  }
+};
+const loadWebFileUrl = async (key: string): Promise<string | null> => {
+  try {
+    const database = await openFilesDb();
+    const blob: any = await new Promise((resolve, reject) => {
+      const request = database.transaction(FILES_DB_STORE, 'readonly').objectStore(FILES_DB_STORE).get(key);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    return blob ? (globalThis as any).URL.createObjectURL(blob) : null;
+  } catch (_error) {
+    return null;
+  }
+};
+
+// ───────────────── When the AI is busy: try again by itself, and explain clearly if it still fails ─────────────────
+const BUSY_REGEX = /busy|overload|unavailable|\b50[234]\b|timeout|timed out|high demand|try again/i;
+const streamWithRetry = async (messages: ChatMessage[], onChunk: (chunk: string) => void, onRetry?: (attempt: number) => void) => {
+  let received = false;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await streamChat(messages, (chunk: string) => { received = true; onChunk(chunk); });
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (received || attempt >= 2 || !BUSY_REGEX.test(message) || LIMIT_MESSAGE_REGEX.test(message)) throw error;
+      if (onRetry) onRetry(attempt + 1);
+      await new Promise((resolve) => setTimeout(resolve, 2500 * (attempt + 1)));
+    }
+  }
+};
+const friendlyChatError = (message: string, hasMedia: boolean): string => {
+  if (hasMedia && BUSY_REGEX.test(message) && !LIMIT_MESSAGE_REGEX.test(message)) {
+    return 'The AI is busy reading this video or audio. Please try again in a minute, or send a shorter or smaller file (under about 5 MB). / AI yana aiki da yawa yanzu. Sake gwadawa nan da minti ɗaya, ko ka aika ƙaramin file.';
+  }
+  return message;
+};
+
+// ───────────────── Conversations kept in the user's account (so they appear on another phone) ─────────────────
+const chatSignature = (conv: any): string => {
+  const { messages, ...rest } = conv || {};
+  const list = Array.isArray(messages) ? messages : [];
+  return `${JSON.stringify(rest)}|${list.length}|${list.length ? list[list.length - 1].id : ''}`;
+};
+const compactChatForCloud = (conv: any) => {
+  const { messages, ...rest } = conv;
+  const slim: any[] = [];
+  let size = 0;
+  const list: any[] = Array.isArray(messages) ? messages : [];
+  for (let index = list.length - 1; index >= 0 && slim.length < 200; index -= 1) {
+    const message = list[index];
+    const item: any = { id: message.id, role: message.role, content: String(message.content || '').slice(0, 12000) };
+    if (message.attachment?.name) item.attachment = { name: message.attachment.name, mimeType: message.attachment.mimeType || '' };
+    size += JSON.stringify(item).length;
+    if (size > 700000) break;
+    slim.unshift(item);
+  }
+  return JSON.parse(JSON.stringify({ ...rest, messages: slim }));
+};
+
 // Asks the Worker to create (or edit, when a picture is given) an image. Returns a data: picture.
-const requestGeneratedImage = async (prompt: string, sourceDataUrl: string | null): Promise<string> => {
+const requestGeneratedImage = async (prompt: string, sourceDataUrl: string | null, extraDataUrls: string[] = []): Promise<string> => {
   const currentUser = auth.currentUser;
   if (!currentUser) throw new Error('Please sign in before creating images.');
   const token = await currentUser.getIdToken();
   const response = await fetch(WORKER_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ action: 'generate_image', prompt, image: sourceDataUrl }),
+    body: JSON.stringify({ action: 'generate_image', prompt, image: sourceDataUrl, ...(extraDataUrls.length && sourceDataUrl ? { images: [sourceDataUrl, ...extraDataUrls] } : {}) }),
   });
   let payload: any = null;
   try { payload = await response.json(); } catch (_error) { /* not JSON */ }
@@ -1690,12 +1782,16 @@ function MessageBubble({
           >
             <Ionicons name={copied ? 'checkmark' : 'copy-outline'} size={20} color={copied ? activeIcon : mutedIcon} />
           </Pressable>
-          <Pressable hitSlop={6} accessibilityLabel="Good response" style={{ padding: 9 }} onPress={() => onFeedback?.(message, 'like')}>
-            <Ionicons name={feedback === 'like' ? 'thumbs-up' : 'thumbs-up-outline'} size={20} color={feedback === 'like' ? activeIcon : mutedIcon} />
-          </Pressable>
-          <Pressable hitSlop={6} accessibilityLabel="Bad response" style={{ padding: 9 }} onPress={() => onFeedback?.(message, 'dislike')}>
-            <Ionicons name={feedback === 'dislike' ? 'thumbs-down' : 'thumbs-down-outline'} size={20} color={feedback === 'dislike' ? activeIcon : mutedIcon} />
-          </Pressable>
+          {feedback !== 'dislike' ? (
+            <Pressable hitSlop={6} accessibilityLabel="Good response" style={{ padding: 9 }} onPress={() => onFeedback?.(message, 'like')}>
+              <Ionicons name={feedback === 'like' ? 'thumbs-up' : 'thumbs-up-outline'} size={20} color={feedback === 'like' ? activeIcon : mutedIcon} />
+            </Pressable>
+          ) : null}
+          {feedback !== 'like' ? (
+            <Pressable hitSlop={6} accessibilityLabel="Bad response" style={{ padding: 9 }} onPress={() => onFeedback?.(message, 'dislike')}>
+              <Ionicons name={feedback === 'dislike' ? 'thumbs-down' : 'thumbs-down-outline'} size={20} color={feedback === 'dislike' ? activeIcon : mutedIcon} />
+            </Pressable>
+          ) : null}
           <Pressable hitSlop={6} accessibilityLabel="Read aloud" style={{ padding: 9 }} onPress={() => onSpeak?.(message)}>
             <Ionicons name={speaking ? 'stop-circle-outline' : 'volume-medium-outline'} size={20} color={speaking ? activeIcon : mutedIcon} />
           </Pressable>
@@ -2075,6 +2171,8 @@ uiLightMode = isLightTheme;
     const [memoryAskText, setMemoryAskText] = useState('');
     const [memoryMenuOpen, setMemoryMenuOpen] = useState(false);
     const [messageFeedback, setMessageFeedback] = useState<Record<string, 'like' | 'dislike'>>({});
+    const [dislikeTarget, setDislikeTarget] = useState<ChatMessage | null>(null);
+    const [dislikeReason, setDislikeReason] = useState('');
     const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
     const [moreMenuMessage, setMoreMenuMessage] = useState<ChatMessage | null>(null);
     const [pendingRegenerate, setPendingRegenerate] = useState<{ text: string; image?: SelectedImage } | null>(null);
@@ -2861,6 +2959,10 @@ const handleForgotPassword = useCallback(async () => {
         setIsSpeaking(false);
       }, []);
 
+    const [historyLoaded, setHistoryLoaded] = useState(false);
+    const historyRef = useRef<ChatConversation[]>([]);
+    historyRef.current = history;
+
     const refreshHistory =
       useCallback(async () => {
         try {
@@ -2868,6 +2970,7 @@ const handleForgotPassword = useCallback(async () => {
             await loadHistory();
 
           setHistory(loaded);
+          setHistoryLoaded(true);
 
           if (
             activeChatId &&
@@ -2891,6 +2994,151 @@ const handleForgotPassword = useCallback(async () => {
     useEffect(() => {
       refreshHistory();
     }, [refreshHistory]);
+
+    // ── Drafts: what the user typed or attached but did not send is kept for each chat ──
+    const draftsRef = useRef<Record<string, DraftSnapshot>>({});
+    const draftsReadyRef = useRef(false);
+    const draftSkipRef = useRef(false);
+    const draftKey = activeChatId || 'new';
+    const draftKeyRef = useRef(draftKey);
+    const draftWriteTimerRef = useRef<any>(null);
+
+    const applyDraftSnapshot = useCallback((snap?: DraftSnapshot) => {
+      const images = snap?.images || [];
+      const docs = snap?.docs || [];
+      setDraft(snap?.text || '');
+      setSelectedImage(images[0] || null);
+      setExtraImages(images.slice(1));
+      setSelectedDocument(docs[0] || null);
+      setExtraDocuments(docs.slice(1));
+    }, []);
+
+    useEffect(() => {
+      AsyncStorage.getItem(DRAFTS_KEY).then((raw) => {
+        if (raw) { try { draftsRef.current = JSON.parse(raw) || {}; } catch (_error) { draftsRef.current = {}; } }
+        draftsReadyRef.current = true;
+        const snap = draftsRef.current[draftKeyRef.current];
+        if (snap && (snap.text || snap.images?.length || snap.docs?.length)) {
+          draftSkipRef.current = true;
+          setTimeout(() => { draftSkipRef.current = false; }, 150);
+          applyDraftSnapshot(snap);
+        }
+      }).catch(() => { draftsReadyRef.current = true; });
+    }, [applyDraftSnapshot]);
+
+    useEffect(() => {
+      if (draftKeyRef.current === draftKey) return;
+      draftKeyRef.current = draftKey;
+      if (!draftsReadyRef.current) return;
+      draftSkipRef.current = true;
+      setTimeout(() => { draftSkipRef.current = false; }, 150);
+      applyDraftSnapshot(draftsRef.current[draftKey]);
+    }, [draftKey, applyDraftSnapshot]);
+
+    useEffect(() => {
+      if (!draftsReadyRef.current) return;
+      if (draftSkipRef.current) { draftSkipRef.current = false; return; }
+      const key = draftKeyRef.current;
+      const images = [selectedImage, ...extraImages].filter((item): item is SelectedImage => !!item && !!item.uri && !item.uri.startsWith('blob:') && !(item.uri.startsWith('data:') && item.uri.length > 400000));
+      const docs = [selectedDocument, ...extraDocuments]
+        .filter((item): item is AttachedDoc => !!item && !!item.uri && (!item.uri.startsWith('blob:') || !!item.text))
+        .map((item) => { const { fullText: _omit, ...rest } = item; return rest as AttachedDoc; });
+      if (!draft.trim() && !images.length && !docs.length) delete draftsRef.current[key];
+      else draftsRef.current[key] = { text: draft, images, docs, at: Date.now() };
+      if (draftWriteTimerRef.current) clearTimeout(draftWriteTimerRef.current);
+      draftWriteTimerRef.current = setTimeout(() => {
+        const entries = (Object.entries(draftsRef.current) as [string, DraftSnapshot][]).sort((a, b) => (b[1].at || 0) - (a[1].at || 0)).slice(0, 30);
+        draftsRef.current = Object.fromEntries(entries);
+        AsyncStorage.setItem(DRAFTS_KEY, JSON.stringify(draftsRef.current)).catch(() => {});
+      }, 400);
+    }, [draft, selectedImage, extraImages, selectedDocument, extraDocuments]);
+
+    // ── Conversations in the user's account: logging in on another phone shows them too ──
+    const cloudSyncedRef = useRef<Record<string, string>>({});
+    const cloudBlockedRef = useRef(false);
+    const lastCloudPullRef = useRef(0);
+    const [cloudReady, setCloudReady] = useState(false);
+
+    const pullCloudChats = useCallback(async (uid: string) => {
+      try {
+        const snap = await getDocs(collection(db, 'users', uid, 'chats'));
+        const remote: any[] = [];
+        snap.forEach((item) => remote.push(item.data()));
+        const localById = new Map<string, any>(historyRef.current.map((item) => [item.id, item]));
+        const toSave: any[] = [];
+        remote.forEach((incoming) => {
+          if (!incoming?.id || !Array.isArray(incoming.messages)) return;
+          const mine = localById.get(incoming.id);
+          if (!mine) { cloudSyncedRef.current[incoming.id] = chatSignature(incoming); toSave.push(incoming); return; }
+          const remoteTime = Number(incoming.updatedAt || 0);
+          const localTime = Number(mine.updatedAt || 0);
+          if (remoteTime > localTime) {
+            const mineMessages = new Map<string, any>((mine.messages || []).map((message: any) => [message.id, message]));
+            const merged = incoming.messages.map((message: any) => {
+              const old = mineMessages.get(message.id);
+              if (!old) return message;
+              const keep: any = {};
+              ['image', 'attachment', 'extraImages', 'extraAttachments', 'splitFiles'].forEach((field) => { if (old[field]) keep[field] = old[field]; });
+              return { ...message, ...keep };
+            });
+            const combined = { ...mine, ...incoming, messages: merged };
+            cloudSyncedRef.current[incoming.id] = chatSignature(combined);
+            toSave.push(combined);
+          } else if (remoteTime === localTime) {
+            cloudSyncedRef.current[incoming.id] = chatSignature(mine);
+          }
+        });
+        if (toSave.length) {
+          for (const conversation of toSave) {
+            try { await saveConversation(conversation as ChatConversation); } catch (_error) { /* keep going */ }
+          }
+          setHistory((current) => {
+            const map = new Map<string, ChatConversation>(current.map((item) => [item.id, item]));
+            toSave.forEach((item) => map.set(item.id, item as ChatConversation));
+            return Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          });
+        }
+        cloudBlockedRef.current = false;
+        setCloudReady(true);
+      } catch (error: any) {
+        console.warn('[IK TECH AI] Could not read chats from the account:', error?.code || error);
+        if (String(error?.code || '').includes('permission')) cloudBlockedRef.current = true;
+        setCloudReady(true);
+      }
+    }, []);
+
+    useEffect(() => {
+      if (!user?.uid || !historyLoaded) { setCloudReady(false); return undefined; }
+      const uid = user.uid;
+      lastCloudPullRef.current = Date.now();
+      void pullCloudChats(uid);
+      const subscription = AppState.addEventListener('change', (state) => {
+        if (state === 'active' && Date.now() - lastCloudPullRef.current > 60000) {
+          lastCloudPullRef.current = Date.now();
+          void pullCloudChats(uid);
+        }
+      });
+      return () => { subscription.remove(); };
+    }, [user?.uid, historyLoaded, pullCloudChats]);
+
+    useEffect(() => {
+      if (!user?.uid || !cloudReady || cloudBlockedRef.current) return undefined;
+      const uid = user.uid;
+      const timer = setTimeout(async () => {
+        const pending = history.filter((item) => item.messages?.length && cloudSyncedRef.current[item.id] !== chatSignature(item)).slice(0, 40);
+        for (const item of pending) {
+          if (cloudBlockedRef.current) break;
+          try {
+            await setDoc(doc(db, 'users', uid, 'chats', item.id), compactChatForCloud(item));
+            cloudSyncedRef.current[item.id] = chatSignature(item);
+          } catch (error: any) {
+            console.warn('[IK TECH AI] Could not save chat to the account:', error?.code || error);
+            if (String(error?.code || '').includes('permission')) cloudBlockedRef.current = true;
+          }
+        }
+      }, 2500);
+      return () => clearTimeout(timer);
+    }, [history, user?.uid, cloudReady]);
 
     const scrollToBottom =
       useCallback(() => {
@@ -2965,6 +3213,10 @@ const handleForgotPassword = useCallback(async () => {
             await deleteConversation(
               conversationId,
             );
+            if (auth.currentUser) {
+              delete cloudSyncedRef.current[conversationId];
+              deleteDoc(doc(db, 'users', auth.currentUser.uid, 'chats', conversationId)).catch(() => {});
+            }
 
             if (
               activeChatId ===
@@ -2997,7 +3249,15 @@ const handleForgotPassword = useCallback(async () => {
         try {
           setErrorMessage(null);
 
+          const idsToRemove = historyRef.current.map((item) => item.id);
           await clearHistory();
+          if (auth.currentUser) {
+            const uid = auth.currentUser.uid;
+            idsToRemove.forEach((id) => {
+              delete cloudSyncedRef.current[id];
+              deleteDoc(doc(db, 'users', uid, 'chats', id)).catch(() => {});
+            });
+          }
 
           setHistory([]);
           setActiveChatId(null);
@@ -3381,7 +3641,16 @@ const handleForgotPassword = useCallback(async () => {
 
           const allImagesForSend: SelectedImage[] = selectedImage ? [selectedImage, ...extraImages] : [];
           const allDocsForSend: AttachedDoc[] = selectedDocument ? [selectedDocument, ...extraDocuments] : [];
-          const stripDoc = (doc: AttachedDoc) => { const { fullText: _omit, ...rest } = doc; return rest; };
+          const webFileKeys = new Map<string, string>();
+          if (Platform.OS === 'web') {
+            for (const doc of allDocsForSend) {
+              if (!doc.text && doc.uri && doc.uri.startsWith('blob:')) {
+                const key = await saveWebFileFromUri(doc.uri, doc.name);
+                if (key) webFileKeys.set(doc.uri, key);
+              }
+            }
+          }
+          const stripDoc = (doc: AttachedDoc) => { const { fullText: _omit, ...rest } = doc; return webFileKeys.has(doc.uri) ? { ...rest, fileKey: webFileKeys.get(doc.uri) } : rest; };
           // "Split this file into 6 files / documents" is done on the phone, so the whole file is kept.
           const splitPlan = detectSplitRequest(text);
           const splitSource = splitPlan ? allDocsForSend.find((doc) => typeof doc.fullText === 'string' && doc.fullText.trim().length > 0) : undefined;
@@ -3467,6 +3736,9 @@ const handleForgotPassword = useCallback(async () => {
           setSelectedDocument(null);
           setExtraImages([]);
           setExtraDocuments([]);
+          delete draftsRef.current[activeChatId || 'new'];
+          delete draftsRef.current['new'];
+          AsyncStorage.setItem(DRAFTS_KEY, JSON.stringify(draftsRef.current)).catch(() => {});
           setIsStreaming(true);
 
           Haptics.impactAsync(
@@ -3513,8 +3785,15 @@ const handleForgotPassword = useCallback(async () => {
               if (imageIntent === 'edit' && selectedImage) {
                 sourceDataUrl = await compressImageDataUri(await readImageAsDataUrl(selectedImage.uri, selectedImage.mimeType));
               }
-              const imagePrompt = text.replace(/^\/(image|imagine|draw)\s*/i, '').trim();
-              const rawImage = await requestGeneratedImage(imagePrompt, sourceDataUrl);
+              let imagePrompt = text.replace(/^\/(image|imagine|draw)\s*/i, '').trim();
+              const extraSources: string[] = [];
+              if (imageIntent === 'edit' && sourceDataUrl) {
+                for (const extra of extraImages.slice(0, 3)) {
+                  try { extraSources.push(await compressImageDataUri(await readImageAsDataUrl(extra.uri, extra.mimeType))); } catch (_error) { /* skip this picture */ }
+                }
+                if (extraSources.length) imagePrompt = `Use all ${extraSources.length + 1} provided pictures together (picture 1 is the first one, picture 2 the second, and so on). ${imagePrompt}`;
+              }
+              const rawImage = await requestGeneratedImage(imagePrompt, sourceDataUrl, extraSources);
               const smallImage = await compressImageDataUri(rawImage);
               generatedImage = { uri: smallImage, mimeType: smallImage.slice(5, smallImage.indexOf(';')) || 'image/jpeg' };
               assistantContent = appLanguage === 'Hausa'
@@ -3619,7 +3898,7 @@ const handleForgotPassword = useCallback(async () => {
               const messagesForAI: ChatMessage[] = lastUser && (contextLines.length || extraForAI.length)
                 ? [...messagesBeforeCurrent, ...contextMessages, ...extraForAI, lastUser]
                 : updatedMessages;
-              await streamChat(messagesForAI, appendAssistantChunk);
+              await streamWithRetry(messagesForAI, appendAssistantChunk, () => showToast('The AI is busy. Trying again…', 'time-outline'));
             }
 
             const assistantMessage:
@@ -3728,7 +4007,7 @@ const handleForgotPassword = useCallback(async () => {
 
             setErrorMessage(
               error instanceof Error
-                ? (error.message.includes('5016') ? 'The AI model needs a one-time license agreement (error 5016). Send the prompt “agree” to the model once, then try again.' : error.message)
+                ? (error.message.includes('5016') ? 'The AI model needs a one-time license agreement (error 5016). Send the prompt “agree” to the model once, then try again.' : friendlyChatError(error.message, allDocsForSend.some((doc) => /^(video|audio)\//.test(doc.mimeType))))
                 : 'Something went wrong. Please try again.',
             );
           } finally {
@@ -4672,8 +4951,13 @@ const handleForgotPassword = useCallback(async () => {
       Alert.alert('Could not open file', 'No app on this phone can open this file type, or the file is no longer available.');
     }
   };
-  const openAttachment = async (attachment: { uri?: string; name: string; mimeType: string; text?: string }) => {
-    if (!attachment) return;
+  const openAttachment = async (rawAttachment: { uri?: string; name: string; mimeType: string; text?: string; fileKey?: string }) => {
+    if (!rawAttachment) return;
+    let attachment = rawAttachment;
+    if (Platform.OS === 'web' && rawAttachment.fileKey) {
+      const restored = await loadWebFileUrl(rawAttachment.fileKey);
+      if (restored) attachment = { ...rawAttachment, uri: restored };
+    }
     const mime = (attachment.mimeType || '').toLowerCase();
     const name = attachment.name || 'File';
     if (mime.startsWith('image/') && attachment.uri) { setImageViewerItem(null); setImageViewerUri(attachment.uri); return; }
@@ -4685,6 +4969,17 @@ const handleForgotPassword = useCallback(async () => {
     const pseudoItem: any = { key: `attachment-${name}`, kind: 'file', id: `attachment-${name}`, name, uri: attachment.uri || '', mimeType: mime, createdAt: Date.now() };
     if (attachment.text) { setLibraryViewer({ item: pseudoItem, text: attachment.text }); return; }
     if (!attachment.uri) { Alert.alert('File not available', 'This file is no longer on this phone. Please attach it again.'); return; }
+    if (Platform.OS === 'web' && !TEXT_FILE_EXTENSIONS.includes(fileExtension(name))) {
+      // Word and other files cannot be drawn inside a web page, so the browser saves/opens them with the right app.
+      const page: any = (globalThis as any).document;
+      const link = page.createElement('a');
+      link.href = attachment.uri;
+      link.download = name;
+      page.body.appendChild(link);
+      link.click();
+      page.body.removeChild(link);
+      return;
+    }
     await openLibraryItem(pseudoItem);
   };
 
@@ -5207,16 +5502,53 @@ const handleForgotPassword = useCallback(async () => {
     } catch (_error) { /* ignore */ }
   };
 
-  const handleFeedback = (message: ChatMessage, type: 'like' | 'dislike') => {
-    const next = { ...messageFeedback };
-    if (next[message.id] === type) delete next[message.id];
-    else next[message.id] = type;
+  const saveFeedbackMap = (next: Record<string, 'like' | 'dislike'>) => {
     setMessageFeedback(next);
     AsyncStorage.setItem('ik-tech-ai:feedback:v1', JSON.stringify(next)).catch(() => {});
+  };
+
+  // Like: the Dislike button disappears. Dislike: a box opens to write why; the AI then corrects itself.
+  const handleFeedback = (message: ChatMessage, type: 'like' | 'dislike') => {
     Haptics.selectionAsync().catch(() => {});
-    if (next[message.id] === 'like') showToast('Thank you for feedback', 'thumbs-up');
-    else if (next[message.id] === 'dislike') showToast('Thanks for your feedback. We will do better', 'thumbs-down');
-    else showToast('Feedback removed', 'close-circle');
+    if (messageFeedback[message.id] === type) {
+      const next = { ...messageFeedback };
+      delete next[message.id];
+      saveFeedbackMap(next);
+      showToast('Feedback removed', 'close-circle');
+      return;
+    }
+    if (type === 'like') {
+      saveFeedbackMap({ ...messageFeedback, [message.id]: 'like' });
+      showToast('Thank you for feedback', 'thumbs-up');
+      return;
+    }
+    setDislikeReason('');
+    setDislikeTarget(message);
+  };
+
+  const submitDislike = () => {
+    const target = dislikeTarget;
+    if (!target) return;
+    const reason = dislikeReason.trim();
+    setDislikeTarget(null);
+    setDislikeReason('');
+    saveFeedbackMap({ ...messageFeedback, [target.id]: 'dislike' });
+    AsyncStorage.getItem('ik-tech-ai:feedback-reasons:v1').then((raw) => {
+      let saved: Record<string, string> = {};
+      if (raw) { try { saved = JSON.parse(raw) || {}; } catch (_error) { saved = {}; } }
+      saved[target.id] = reason;
+      return AsyncStorage.setItem('ik-tech-ai:feedback-reasons:v1', JSON.stringify(saved));
+    }).catch(() => {});
+    const hausa = appLanguage === 'Hausa' || looksHausa(reason);
+    Alert.alert(
+      hausa ? 'Mun gode' : 'Thank you',
+      hausa ? 'Mun ji ka, kuma za mu gyara wannan kuskuren.' : 'We are sorry about that. We will work on fixing this mistake.',
+    );
+    const snippet = String(target.content || '').replace(/\s+/g, ' ').slice(0, 160);
+    const correction = hausa
+      ? `Amsarka ta baya ba ta yi daidai ba${snippet ? ` ("${snippet}…")` : ''}.${reason ? ` Dalili: ${reason}.` : ''} Don Allah ka gane kuskuren, ka nemi afuwa a taƙaice, sannan ka gyara amsar.`
+      : `Your previous answer was not right${snippet ? ` ("${snippet}…")` : ''}.${reason ? ` Reason: ${reason}.` : ''} Please understand the mistake, apologize briefly, and give a corrected answer.`;
+    setTimeout(() => { void handleSend(correction); }, 450);
   };
 
   const handleSpeakMessage = (message: ChatMessage) => {
@@ -6645,7 +6977,34 @@ const handleForgotPassword = useCallback(async () => {
                           {cropUri ? <CropEditor uri={cropUri} onCancel={() => setCropUri(null)} onDone={saveCroppedImage} /> : null}
                         </Modal>
                         <Modal visible={!!mediaViewer} animationType="slide" statusBarTranslucent onRequestClose={() => setMediaViewer(null)}>
-                          {mediaViewer ? <MediaViewer media={mediaViewer} onClose={() => setMediaViewer(null)} onExternal={() => { const media = mediaViewer; setMediaViewer(null); if (media) setTimeout(() => { void openExternalFile(media.uri, media.name, media.mimeType); }, 350); }} /> : null}
+                          {dislikeTarget ? (
+                      <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={() => setDislikeTarget(null)}>
+                        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.62)', alignItems: 'center', justifyContent: 'flex-start', paddingTop: 90, paddingHorizontal: 22 }}>
+                          <View style={{ width: '100%', maxWidth: 420, borderRadius: 22, backgroundColor: panelBg, padding: 20 }}>
+                            <Text style={{ color: primaryText, fontSize: 18, fontWeight: '800', marginBottom: 6 }}>{appLanguage === 'Hausa' ? 'Me ya sa ba ka gamsu ba?' : 'What was wrong with this answer?'}</Text>
+                            <Text style={{ color: secondaryText, fontSize: 13, marginBottom: 12 }}>{appLanguage === 'Hausa' ? 'Rubuta dalilin, don mu gyara.' : 'Write the reason so it can be fixed.'}</Text>
+                            <TextInput
+                              value={dislikeReason}
+                              onChangeText={setDislikeReason}
+                              multiline
+                              autoFocus
+                              placeholder={appLanguage === 'Hausa' ? 'Rubuta dalili a nan…' : 'Write the reason here…'}
+                              placeholderTextColor={secondaryText}
+                              style={{ minHeight: 90, maxHeight: 180, color: primaryText, borderWidth: 1, borderColor: secondaryText, borderRadius: 14, padding: 12, fontSize: 15, textAlignVertical: 'top' }}
+                            />
+                            <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 14, gap: 10 }}>
+                              <Pressable onPress={() => setDislikeTarget(null)} style={{ paddingVertical: 11, paddingHorizontal: 18, borderRadius: 14 }}>
+                                <Text style={{ color: secondaryText, fontWeight: '700', fontSize: 15 }}>{uiText.cancel}</Text>
+                              </Pressable>
+                              <Pressable onPress={submitDislike} style={{ paddingVertical: 11, paddingHorizontal: 22, borderRadius: 14, backgroundColor: accentColor }}>
+                                <Text style={{ color: '#ffffff', fontWeight: '800', fontSize: 15 }}>{appLanguage === 'Hausa' ? 'Aika' : 'Submit'}</Text>
+                              </Pressable>
+                            </View>
+                          </View>
+                        </View>
+                      </Modal>
+                    ) : null}
+                    {mediaViewer ? <MediaViewer media={mediaViewer} onClose={() => setMediaViewer(null)} onExternal={() => { const media = mediaViewer; setMediaViewer(null); if (media) setTimeout(() => { void openExternalFile(media.uri, media.name, media.mimeType); }, 350); }} /> : null}
                         </Modal>
 
                         <Modal
@@ -8342,7 +8701,6 @@ const handleForgotPassword = useCallback(async () => {
         markdownListText: {
         flex: 1,
         },
-
         markdownQuote: {
         borderLeftWidth: 3,
         borderLeftColor: '#3973ad',
@@ -9310,6 +9668,7 @@ const handleForgotPassword = useCallback(async () => {
         </>
         );
         }
+
 
 
 
